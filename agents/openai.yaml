@@ -1,0 +1,4 @@
+interface:
+  display_name: "Merge Listed and Clinical Pools"
+  short_description: "Merge listed and clinical molecule pools safely"
+  default_prompt: "Use $merge-listed-and-clinical-pools to validate, align, compare, and finalize my listed and clinical molecule pools."
