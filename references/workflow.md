@@ -47,13 +47,18 @@ Stop when a missing value or version ambiguity prevents stable matching or audit
 
 ### Run Schema confirmation
 
-The 37 fields in `baseline-schema.json` are a recommended starting point, not a fixed output contract. For every run:
+The 21 fields in `baseline-schema.json` are the current cross-TA common starting point. They remain a run schema rather than a permanent technical constant; a TA-specific change still requires explicit confirmation. For every run:
 
 1. Mark each baseline field keep/remove/rename/reorder.
 2. Define every added field's business purpose, source mapping on both sides, missing rule, and whether it affects matching.
-3. Preserve or replace the minimum logical fields: source ID, data source, asset name, related indication, mapped Disease, dosage form, and the state fields needed for the run.
+3. Preserve the minimum logical fields: source ID in audit metadata, asset name, related indication, mapped Disease, dosage form, and the state fields needed for the run. A visible `数据来源` field is optional because source provenance is also retained in hidden workflow metadata and the raw sheets.
 4. Freeze the approved ordered field list as the Run Schema.
 5. Reopen this gate after any later field change.
+
+The common 21-field contract includes two special mappings:
+
+- listed `持证商` and clinical `申办方` both map to `License Holder`; the raw sheets preserve their original headers and definitions;
+- both sources map one already-prepared `是否VBP` field; this workflow does not derive, split, or recompute VBP status.
 
 Do not use column positions as meaning. Always map by confirmed header name.
 
@@ -63,7 +68,7 @@ Do not use column positions as meaning. Always map by confirmed header name.
 
 - Place listed rows first and clinical rows second.
 - Assign temporary sequential molecule IDs across both sections.
-- Add a source label.
+- Track a source label in hidden workflow metadata. Add a visible source field only when it belongs to the approved Run Schema.
 - Fill unavailable source-specific fields with the configured export placeholder; never replace real `0` or `False`.
 - Keep copied raw listed and clinical sheets.
 - Use static values in the combined main sheet.

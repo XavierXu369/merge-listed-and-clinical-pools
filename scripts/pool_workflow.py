@@ -252,7 +252,7 @@ def validate_config_shape(config: dict[str, Any]) -> None:
     names = [item.get("name") for item in config["run_schema"]]
     if any(not name for name in names) or len(names) != len(set(names)):
         raise ValueError("Run Schema field names must be nonblank and unique.")
-    valid_modes = {"sequence", "constant", "column", "column_or_missing", "missing"}
+    valid_modes = {"sequence", "constant", "column", "column_or_missing", "coalesce_columns", "missing"}
     for item in config["run_schema"]:
         for source in ("listed", "clinical"):
             rule = item.get(source)
@@ -260,7 +260,28 @@ def validate_config_shape(config: dict[str, Any]) -> None:
                 raise ValueError(f"Invalid {source} mapping rule for field: {item.get('name')}")
             if rule["mode"] in {"column", "column_or_missing"} and not rule.get("column"):
                 raise ValueError(f"Column mapping lacks a column name: {item.get('name')} / {source}")
+            if rule["mode"] == "coalesce_columns":
+                columns = rule.get("columns")
+                if not isinstance(columns, list) or not columns or any(not clean_text(column, missing="") for column in columns):
+                    raise ValueError(f"Coalesced mapping needs a nonempty columns list: {item.get('name')} / {source}")
     final_names = set(names)
+    required_logical_fields = {
+        "sequence",
+        "asset",
+        "indication",
+        "disease",
+        "registration_no",
+        "project_stage",
+        "product_stage",
+        "trial_phase",
+        "trial_status",
+        "common_name",
+        "dosage_form",
+        "group",
+    }
+    missing_logical_fields = sorted(required_logical_fields - set(config["final_fields"]))
+    if missing_logical_fields:
+        raise ValueError("final_fields is missing logical fields: " + ", ".join(missing_logical_fields))
     for logical, field in config["final_fields"].items():
         if field not in final_names:
             raise ValueError(f"final_fields.{logical} points outside Run Schema: {field}")
@@ -301,6 +322,12 @@ def inspect_one_source(config: dict[str, Any], source: str) -> tuple[dict[str, A
         return {"file": str(path), "sheet": sheet_name, "readable": False}, blockers + [str(exc)]
     missing_required = [field for field in source_required_fields(config, source) if field not in headers]
     blockers.extend(f"{source} missing required field: {field}" for field in missing_required)
+    for item in config["run_schema"]:
+        rule = item[source]
+        if rule["mode"] == "coalesce_columns" and not any(column in headers for column in rule["columns"]):
+            blockers.append(
+                f"{source} lacks every fallback column for {item['name']}: {', '.join(rule['columns'])}"
+            )
 
     source_id = section.get("source_id", "")
     blank_ids = 0
@@ -462,6 +489,11 @@ def mapped_value(rule: dict[str, Any], record: dict[str, Any], sequence: int, mi
         return display_value(rule.get("value"), missing)
     if mode == "missing":
         return missing
+    if mode == "coalesce_columns":
+        for column in rule["columns"]:
+            if column in record and not is_blank(record.get(column)):
+                return display_value(record.get(column), missing)
+        return missing
     column = rule["column"]
     if column not in record:
         if mode == "column_or_missing":
@@ -618,6 +650,21 @@ def read_meta(ws) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
     return mapping, state
 
 
+def record_source(
+    record: dict[str, Any],
+    fields: dict[str, str],
+    meta_map: dict[str, dict[str, str]],
+) -> str:
+    """Return source provenance without requiring a visible output column."""
+    source_field = fields.get("source", "")
+    if source_field and source_field in record:
+        source = clean_text(record.get(source_field), missing="")
+        if source:
+            return source
+    sequence = stable_key(record.get(fields["sequence"]))
+    return clean_text(meta_map.get(sequence, {}).get("source"), missing="")
+
+
 def get_record(record: dict[str, Any], field_name: str) -> Any:
     return record.get(field_name, "")
 
@@ -731,11 +778,10 @@ def command_build_candidates(args) -> None:
     meta_map, _ = read_meta(wb[META_SHEET])
     fields = config["final_fields"]
     sequence_field = fields["sequence"]
-    source_field = fields["source"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
-    listed = [record for record in records if clean_text(record[source_field]) == listed_source]
-    clinical = [record for record in records if clean_text(record[source_field]) == clinical_source]
+    listed = [record for record in records if record_source(record, fields, meta_map) == listed_source]
+    clinical = [record for record in records if record_source(record, fields, meta_map) == clinical_source]
     missing = config.get("missing_display", "—")
     threshold = float(config.get("candidate_similarity_threshold", 0.78))
     approx_limit = int(config.get("approximate_candidate_limit", 5))
@@ -931,13 +977,13 @@ def finalization_preview(config: dict[str, Any], workbook: str | Path) -> tuple[
     groups: dict[str, list[int]] = defaultdict(list)
     for row in range(2, relation_last_row + 1):
         groups[stable_key(relation.cell(row, relation_map["临床分子序号"]).value)].append(row)
+    meta_map, _ = read_meta(wb[META_SHEET])
     fields = config["final_fields"]
-    source_field = fields["source"]
     sequence_field = fields["sequence"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
-    listed_records = [record for record in draft_records if clean_text(record[source_field]) == listed_source]
-    clinical_records = [record for record in draft_records if clean_text(record[source_field]) == clinical_source]
+    listed_records = [record for record in draft_records if record_source(record, fields, meta_map) == listed_source]
+    clinical_records = [record for record in draft_records if record_source(record, fields, meta_map) == clinical_source]
     listed_sequences = {stable_key(record[sequence_field]) for record in listed_records}
     clinical_sequences = {stable_key(record[sequence_field]) for record in clinical_records}
     errors: list[str] = []
@@ -1005,6 +1051,7 @@ def finalization_preview(config: dict[str, Any], workbook: str | Path) -> tuple[
         "listed_sequences": listed_sequences,
         "listed_records": listed_records,
         "clinical_records": clinical_records,
+        "meta_map": meta_map,
     }
     return preview, context
 
@@ -1078,24 +1125,24 @@ def command_finalize(args) -> None:
         }
     fields = config["final_fields"]
     sequence_field = fields["sequence"]
-    source_field = fields["source"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
+    meta_map, _ = read_meta(wb[META_SHEET])
     headers = [item["name"] for item in config["run_schema"]]
-    final_rows: list[tuple[dict[str, Any], int, str]] = []
+    final_rows: list[tuple[dict[str, Any], int, str, str]] = []
     clinical_to_final: dict[str, int] = {}
     for record in draft_records:
-        source_value = clean_text(record[source_field])
+        source_value = record_source(record, fields, meta_map)
         old_sequence = stable_key(record[sequence_field])
         if source_value == listed_source:
-            final_rows.append((record, record["__row_number__"], old_sequence))
+            final_rows.append((record, record["__row_number__"], old_sequence, source_value))
         elif source_value == clinical_source and decisions[old_sequence]["action"] == "KEEP":
             corrected = dict(record)
             if decisions[old_sequence]["disease_correction"]:
                 corrected[fields["disease"]] = decisions[old_sequence]["disease_correction"]
             if decisions[old_sequence]["asset_correction"]:
                 corrected[fields["asset"]] = decisions[old_sequence]["asset_correction"]
-            final_rows.append((corrected, record["__row_number__"], old_sequence))
+            final_rows.append((corrected, record["__row_number__"], old_sequence, source_value))
     final = wb.create_sheet(final_name, 0)
     for col, header in enumerate(headers, start=1):
         final.cell(1, col).value = header
@@ -1103,13 +1150,13 @@ def command_finalize(args) -> None:
         if source_cell.has_style:
             final.cell(1, col)._style = copy(source_cell._style)
         final.column_dimensions[get_column_letter(col)].width = draft.column_dimensions[get_column_letter(col)].width
-    for new_sequence, (record, source_row, old_sequence) in enumerate(final_rows, start=1):
+    for new_sequence, (record, source_row, old_sequence, source_value) in enumerate(final_rows, start=1):
         record[sequence_field] = new_sequence
         output_row = new_sequence + 1
         for col, header in enumerate(headers, start=1):
             final.cell(output_row, col).value = record.get(header)
         copy_row_style(draft, source_row, final, output_row, len(headers))
-        if clean_text(record[source_field]) == clinical_source:
+        if source_value == clinical_source:
             clinical_to_final[old_sequence] = new_sequence
     final.freeze_panes = "A2"
     final.auto_filter.ref = final.dimensions
@@ -1157,7 +1204,7 @@ def command_finalize(args) -> None:
     final_ws = verify[final_name]
     final_headers, _, final_records = records_from_sheet(final_ws)
     final_sequences = [record[sequence_field] for record in final_records]
-    source_counts = Counter(clean_text(record[source_field]) for record in final_records)
+    source_counts = Counter(source_value for _, _, _, source_value in final_rows)
     listed_fp = sheet_fingerprint(verify[config["listed"]["raw_output_sheet"]])
     clinical_fp = sheet_fingerprint(verify[config["clinical"]["raw_output_sheet"]])
     checks = {
