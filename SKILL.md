@@ -1,40 +1,53 @@
 ---
 name: merge-listed-and-clinical-pools
-description: Validate, align, compare, and finalize China-listed and China-clinical Excel molecule or asset pools for one therapeutic area. Use when Codex must confirm a run-specific output schema, create an auditable combined draft, generate high-recall cross-library candidates, concentrate medical or business exceptions for approval, and apply closed keep/delete/exclude decisions without altering the source sheets.
+description: Validate, align, compare, and consolidate China-listed and China-clinical Excel molecule or asset pools for one therapeutic area. Use when Codex must freeze a run-specific full-pool schema and Clean schema, generate high-recall cross-library candidates, execute approved keep/delete/exclude decisions, create an authoritative full baseline, optionally coordinate marketed-information supplements for clinical-source marketed rows, and derive a Working or Final Clean view without altering the source workbooks.
 ---
 
 # Merge Listed And Clinical Pools
 
-Create one traceable final molecule pool from a cleaned China-listed pool and a cleaned China-clinical pool. Treat the business unit as `asset or fixed combination × dosage form × mapped disease`; do not deduplicate by name or registration number alone.
+Build one auditable pool from cleaned listed and clinical sources. Treat the normal business grain as `asset or fixed component set × dosage form × mapped Disease`. Do not deduplicate by molecule name, trial number, company, target, or marketed stage alone.
 
 Before acting, read:
 
-- [references/workflow.md](references/workflow.md) for the full workflow and decision matrix.
-- [references/decision-contract.md](references/decision-contract.md) before generating, importing, or executing decisions.
-- [references/baseline-schema.json](references/baseline-schema.json) when proposing the run-specific field schema.
+- [references/workflow.md](references/workflow.md) for the end-to-end gates and decision matrix.
+- [references/decision-contract.md](references/decision-contract.md) before creating or importing decisions.
+- [references/output-and-supplement-contract.md](references/output-and-supplement-contract.md) before supplementing marketed information or deriving Clean.
+- [references/baseline-schema.json](references/baseline-schema.json) when preparing the run config.
+
+## Core model
+
+- Treat the **full pool** as the single fact baseline after cross-library decisions close.
+- Derive every Clean version from the latest full pool; never rebuild Clean independently from the two raw sources.
+- Permit a **Working Clean** before marketed-information supplements or downstream modules close.
+- Require a **Final Clean** to disclose and close supplement/module states, then bind it to the current full-pool fingerprint.
+- Return every late supplement to the full pool first. Regenerate Clean afterward and recheck only modules affected by changed fields.
+- Keep BI ownership, MOA overlap, VBP derivation, Giant MNC/TA-leading-company judgment, and commercial prioritization outside this Skill. Carry their approved outputs only.
 
 ## Required workflow
 
-Follow the gates in order. Never jump directly from input receipt or candidate generation to finalization.
+Follow the gates in order. A later gate may run in parallel only where this contract explicitly allows it.
 
-1. **Collect inputs.** Request the TA name, listed and clinical workbook paths and sheet names, the effective TA Disease mapping field/list, inclusion dates/scope, output directory, and field additions or removals requested for this run.
-2. **Create a run config.** Copy `references/baseline-schema.json` outside the Skill folder, fill the input paths and sheet names, and adjust the logical source fields. Keep `schema_approved` false.
-3. **Inspect read-only.** Run `inspect`. Report sheet dimensions, headers, stable IDs, required-field gaps, Disease blanks/multivalue cells, within-source duplicate signatures, status values, formulas, and external-link risk.
-4. **Propose and confirm Run Schema.** Start from the common 21-field baseline, but allow fields to be kept, removed, renamed, added, or reordered when a TA has an approved exception. Confirm that listed `持证商` and clinical `申办方` both map into `License Holder`, while their source-specific meanings remain visible on the raw sheets. Confirm that `是否VBP` is an upstream value to map, not a value calculated here. Report the final field count `C`, both source mappings, missing-value behavior, and audit-only fields. Wait for explicit approval, then freeze the approved field list in the run config and set `schema_approved` true.
-5. **Build the combined draft.** Run `build-draft` only with `--confirmed-schema`. Verify `listed rows + clinical rows = draft rows`, the approved `C` fields, source counts tracked in hidden workflow metadata, sequential temporary IDs, and preserved raw sheets. Do not add a visible `数据来源` column unless the approved Run Schema explicitly requests one.
-6. **Generate candidates.** Run `build-candidates`. Treat its result as high-recall review material, never as an automatic deletion list. Report unique clinical rows, candidate rows, one-to-many cases, initial relation types, and no-candidate marketed records.
-7. **Resolve decisions.** Apply the rules in `workflow.md`. Fill the structured decision fields, group unresolved items for one concentrated confirmation, and perform targeted professional-database checks only when a small missing fact can close a decision. Use `import-decisions` when decisions are stored in JSON.
-8. **Preview finalization.** Run `finalize --mode preview`. Require one nonconflicting action per unique clinical source row, valid carrier IDs for listed-covered deletions, closed decision statuses, and zero `HOLD`/Pending items. Show the expected row arithmetic and pause for explicit execution approval.
-9. **Generate and verify.** Run `finalize --mode generate --confirmed`. Reopen the result and verify the final sequence, source counts, action counts, relation mappings, raw-sheet fingerprints, exact Run Schema, no trailing formatted blank rows, and no external formulas in the final pool.
-10. **Report completion.** Provide a clickable output path, input/action/final counts, Pending count, raw-sheet preservation, and QC result.
+1. **Collect inputs.** Obtain the TA; listed and clinical workbook/sheet paths; upstream Mapping version; run scope dates; stable source IDs or approved run-frozen fallback; output directory; full and Clean field requirements; supplement trigger and fields; downstream module list; and missing-display rule.
+2. **Create a run config.** Copy `references/baseline-schema.json` outside the Skill. Replace every placeholder. Keep `schema_approved` false.
+3. **Inspect read-only.** Run `inspect`. Report dimensions, headers, source-ID quality, required-field gaps, Disease blanks/multivalue cells, within-source duplicate signatures, stage/status values, formulas/cached-value risk, input hashes, and source-sheet fingerprints.
+4. **Confirm the Run Schema.** Freeze `wide_schema`, `clean_schema`, optional `clean_auxiliary_schema`, logical `wide_fields`, sheet names, conditional field rules, and supplement/module settings. Do not treat 37, 40, 21, or any TA-specific count as a constant. Wait for explicit approval; then set `schema_approved` true.
+5. **Build the draft.** Run `build-draft --confirmed-schema`. Verify `listed rows + clinical rows = draft rows`, the approved full-field count, static mapped values, source provenance, raw-sheet cell/formula fingerprints, input hashes, config hash, and run fingerprint.
+6. **Generate candidates.** Run `build-candidates`. Treat all results as review material, never automatic deletions. Report unique clinical rows, candidate rows, one-to-many groups, initial relation types, no-candidate marketed rows, and the candidate fingerprint.
+7. **Resolve decisions.** Apply `workflow.md`. Use one action per unique clinical source row. Import only a JSON decision set bound to the emitted candidate fingerprint.
+8. **Preview the full baseline.** Run `finalize-full --mode preview`. Require closed nonconflicting actions, valid listed carriers, zero `HOLD`/Pending groups, matching run/candidate fingerprints, and valid row arithmetic. Pause for explicit execution approval.
+9. **Generate the full baseline.** Run `finalize-full --mode generate --confirmed`. Reopen and verify the full schema, sequence, source counts, relation mappings, raw-sheet fingerprints, static values, and hidden run manifest. Do not calculate downstream module fields here.
+10. **Proceed flexibly after the full baseline.** The following may run in parallel:
+    - generate a Working Clean;
+    - export/collect/apply marketed-information supplements;
+    - run downstream ownership, MOA, and company-classification modules.
+11. **Apply late information safely.** Generate a supplement template with `build-supplement-template`. Apply returned information with `apply-supplements`; match only by the locked full-pool ID, write the full pool first, never overwrite a valid value without explicit permission, retain closed statuses, and mark any existing Clean stale.
+12. **Derive Clean.** Run `derive-clean --stage working` at any time after the full baseline. Run `derive-clean --stage final` only after required supplement and module states are closed. Replace any earlier Clean only in a new output workbook and bind it to the current full fingerprint.
+13. **Report completion.** Provide clickable paths, input/action/full/Clean counts, full/Clean ID and order agreement, supplement/module states, stale-state resolution, raw-sheet verification, fingerprints, exceptions, and QC.
 
-## Run the script
-
-The script requires Python and `openpyxl`. It refuses to overwrite an existing output.
+## Commands
 
 ```powershell
-python .\scripts\pool_workflow.py inspect `
-  --config "C:\path\run-config.json"
+python .\scripts\pool_workflow.py inspect --config "C:\path\run-config.json"
 
 python .\scripts\pool_workflow.py build-draft `
   --config "C:\path\run-config.json" `
@@ -47,53 +60,65 @@ python .\scripts\pool_workflow.py build-candidates `
   --output "C:\path\TA_pool_candidates.xlsx"
 
 python .\scripts\pool_workflow.py import-decisions `
+  --config "C:\path\run-config.json" `
   --workbook "C:\path\TA_pool_candidates.xlsx" `
   --decisions "C:\path\decisions.json" `
   --output "C:\path\TA_pool_decided.xlsx"
 
-python .\scripts\pool_workflow.py finalize `
+python .\scripts\pool_workflow.py finalize-full `
   --mode preview `
   --config "C:\path\run-config.json" `
   --workbook "C:\path\TA_pool_decided.xlsx"
 
-python .\scripts\pool_workflow.py finalize `
-  --mode generate `
-  --confirmed `
+python .\scripts\pool_workflow.py finalize-full `
+  --mode generate --confirmed `
   --config "C:\path\run-config.json" `
   --workbook "C:\path\TA_pool_decided.xlsx" `
+  --output "C:\path\TA_pool_full.xlsx"
+
+python .\scripts\pool_workflow.py build-supplement-template `
+  --config "C:\path\run-config.json" `
+  --workbook "C:\path\TA_pool_full.xlsx" `
+  --output "C:\path\TA_marketed_supplement.xlsx"
+
+python .\scripts\pool_workflow.py apply-supplements `
+  --config "C:\path\run-config.json" `
+  --workbook "C:\path\TA_pool_full_or_working_clean.xlsx" `
+  --supplement "C:\path\TA_marketed_supplement_returned.xlsx" `
+  --output "C:\path\TA_pool_supplemented.xlsx"
+
+python .\scripts\pool_workflow.py derive-clean `
+  --stage working `
+  --config "C:\path\run-config.json" `
+  --workbook "C:\path\TA_pool_full.xlsx" `
+  --output "C:\path\TA_pool_working_clean.xlsx"
+
+python .\scripts\pool_workflow.py derive-clean `
+  --stage final --confirmed-current-full `
+  --config "C:\path\run-config.json" `
+  --workbook "C:\path\TA_pool_latest.xlsx" `
   --output "C:\path\TA_pool_final.xlsx"
 ```
 
 ## Hard rules
 
-- Never overwrite an input, intermediate, or approved delivery.
-- Never build a draft before Run Schema approval.
-- Never delete because a name is similar or a China stage says `已上市`.
-- Never treat candidate rows as unique clinical rows; one clinical row may have several listed candidates.
-- Never split `License Holder` back into separate holder and sponsor columns in the common 21-field output; preserve those source distinctions on the raw sheets.
-- Never recalculate VBP in this Skill. Map the already-prepared upstream `是否VBP` value and stop if the required run mapping is unclear.
-- Never merge a different Disease without checking the indication evidence.
-- Keep new Disease, new dosage form, new research molecule, fixed combination, and materially distinct chemical-form candidates unless a confirmed rule says otherwise.
-- Exclude diagnostic/non-therapeutic assets and non-fixed regimens only after the asset nature is established.
-- Do not force clinical sponsor or trial details into a listed row. Keep the listed row and preserve clinical evidence in the relation and raw sheets.
-- Preserve the complete main experimental-drug name when a new molecule is combined with background therapy.
-- Do not finalize with blank actions, conflicting actions, open statuses, `HOLD`, or an invalid listed carrier.
-- Keep the copied raw sheets unchanged. Build the final pool from static values and physically omit removed rows.
-- Treat the cardiovascular regression case as a test fixture only. Never use its counts, rates, or decisions as another TA's target or default.
+- Never overwrite an input, intermediate, or delivery.
+- Never build before schema approval or use a decision set from another candidate fingerprint.
+- Never use marketed stage, registration-number difference, company similarity, title similarity, target equality, or missing launch information as a standalone keep/delete rule.
+- Never count candidate rows as unique clinical rows.
+- Never renumber the full baseline after it is locked; use its ID for every supplement, module, and Clean join.
+- Never maintain Full and Clean independently. Full wins every conflict.
+- Never make marketed-information completion a prerequisite for Working Clean.
+- Never label a Clean as final while required supplement/module states remain open or it is bound to an older full fingerprint.
+- Never update Clean first when late information arrives.
+- Never recalculate VBP or execute BI/MOA/company-classification modules here.
+- Never silently overwrite nonblank full-pool values with supplement blanks or conflicting values.
+- Never use a cardiovascular, kidney, or other TA fixture's row/column counts as another TA's target.
 
 ## Stop conditions
 
-Stop and request direction when input versions are unclear; required fields or stable IDs are missing; a Disease cell contains unresolved multiple results; source libraries still contain unapproved within-library duplicates; the TA Disease lists differ; Run Schema is not approved; a candidate requires medical, chemical-form, fixed-combination, or marketed-gap judgment; decisions conflict across one-to-many candidates; Pending remains; or row arithmetic/raw-sheet verification fails.
+Stop when input versions are unclear; required fields or stable source IDs are unusable; source Mapping states are unresolved; Disease cells contain unresolved multiple results; source schemas or TA lists conflict; a candidate requires unresolved medical/chemical/formulation judgment; one-to-many decisions conflict; a decision fingerprint drifts; Pending/HOLD remains before full generation; supplement IDs are missing/duplicated/unknown; a conflicting supplement overwrite lacks approval; a Final Clean gate is open; Full/Clean IDs or order diverge; formulas lack cached values needed for static output; source/raw fingerprints drift; or row arithmetic/QC fails.
 
 ## Completion report
 
-Report:
-
-- listed, clinical, and draft input rows;
-- approved Run Schema field count;
-- unique clinical rows, candidate rows, and one-to-many count;
-- listed-covered deletions and each exclusion action count;
-- retained clinical rows and final source composition;
-- final sequence range and Pending count;
-- raw-sheet and row-arithmetic verification;
-- exceptions and the output path.
+Report the input paths and fingerprints; approved full/Clean field counts; listed, clinical, draft, decision, and full counts; action counts; full sequence; supplement candidate and status counts; downstream module states; Working/Final Clean state; full/Clean ID and order check; raw-sheet/formula checks; exceptions; and output paths.

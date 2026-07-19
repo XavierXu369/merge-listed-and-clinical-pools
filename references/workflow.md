@@ -3,97 +3,119 @@
 ## Contents
 
 1. Purpose and boundaries
-2. Input and schema gates
+2. Inputs and Run Schema
 3. Draft and candidate generation
-4. Decision order and matrix
-5. Concentrated confirmation
-6. Finalization and QC
+4. Decision matrix
+5. Full baseline
+6. Parallel post-baseline work
+7. Clean derivation and final QC
 
 ## 1. Purpose and boundaries
 
-Use this workflow after both source libraries have completed their own upstream cleaning and Disease mapping. The desired business unit is normally:
+Use this workflow only after both source libraries complete upstream cleaning, indication Mapping, and approved within-source consolidation. The normal business grain is:
 
 ```text
 asset or fixed component set × dosage form × mapped Disease
 ```
 
-The workflow aligns two unlike schemas, creates a combined draft, generates cross-library comparison candidates, closes exceptions, and executes structured decisions with an audit trail.
+This workflow aligns unlike schemas, generates cross-library candidates, closes decisions, locks the full-pool fact baseline, coordinates optional marketed-information supplements, and derives Clean views.
 
-It does not perform BI-product matching, MOA deduplication, VBP reduction, MNC tagging, commercial prioritization, or a wholesale remapping of the TA Disease taxonomy.
+It does not execute:
+
+- company-owned-product matching;
+- MOA overlap matching;
+- VBP derivation;
+- Giant MNC or TA-leading-company classification;
+- commercial prioritization;
+- wholesale TA Disease remapping.
 
 Required upstream state:
 
-- The listed pool is already split/mapped and consolidated within the listed source.
-- The clinical pool is already cleaned to an approved source-row grain.
-- Each Disease cell contains one resolved result or an explicit review state.
-- Both pools use the same TA Disease list/version.
-- Every source row has a stable ID; generate a technical `Sheet!R<row>` ID only when no reliable clinical ID exists.
+- Listed data are already split, mapped, and consolidated to the approved listed grain.
+- Clinical data are already cleaned to the approved clinical source-row grain.
+- Every included row has one resolved Disease.
+- Both sources use the same approved TA Disease list/version.
+- A reliable source ID exists, or a run-frozen fallback ID is explicitly approved and bound to the source fingerprint.
 
-## 2. Input and schema gates
+## 2. Inputs and Run Schema
 
 ### Read-only preflight
 
-Check before writing:
+Inspect:
 
-- files, sheets, headers, hidden/trailing cells, formulas, and external links;
-- blank/duplicate stable IDs;
-- required asset, indication, Disease, and dosage-form values;
+- input file hashes, selected sheets, effective bounds, headers, hidden/trailing cells, formulas, cached values, and external links;
+- blank/duplicate source IDs and any fallback-ID risk;
+- required asset, indication, Disease, dosage-form, stage, and audit fields;
 - unresolved multivalue Disease cells;
-- project/product stage and trial phase/status value variants;
-- obvious within-source `asset + dosage form + Disease` duplicates;
-- diagnostic, imaging, testing, combination, and marketed-no-candidate signals.
+- project/product stage and trial phase/status variants;
+- within-source `asset + dosage form + Disease` duplicate signatures;
+- diagnostic, testing, non-fixed-regimen, new-combination, and marketed-no-candidate signals.
 
-Stop when a missing value or version ambiguity prevents stable matching or auditing.
+Do not construct output when a gap prevents stable matching or auditing.
 
-### Run Schema confirmation
+### Run Schema contract
 
-The 21 fields in `baseline-schema.json` are the current cross-TA common starting point. They remain a run schema rather than a permanent technical constant; a TA-specific change still requires explicit confirmation. For every run:
+Freeze four independent structures for every run:
 
-1. Mark each baseline field keep/remove/rename/reorder.
-2. Define every added field's business purpose, source mapping on both sides, missing rule, and whether it affects matching.
-3. Preserve the minimum logical fields: source ID in audit metadata, asset name, related indication, mapped Disease, dosage form, and the state fields needed for the run. A visible `数据来源` field is optional because source provenance is also retained in hidden workflow metadata and the raw sheets.
-4. Freeze the approved ordered field list as the Run Schema.
-5. Reopen this gate after any later field change.
+1. `wide_schema`: the authoritative full-pool fields and listed/clinical mappings.
+2. `wide_fields`: logical fields used by matching, decisions, provenance, IDs, and stages.
+3. `clean_schema`: the ordered core Clean fields derived only from the full pool.
+4. `clean_auxiliary_schema`: optional run-specific fields appended to a Working Clean for manual downstream judgments.
 
-The common 21-field contract includes two special mappings:
+The field counts are run outputs, not constants. A historical 37-, 40-, or 21-field workbook is a fixture only.
 
-- listed `持证商` and clinical `申办方` both map to `License Holder`; the raw sheets preserve their original headers and definitions;
-- both sources map one already-prepared `是否VBP` field; this workflow does not derive, split, or recompute VBP status.
+Every mapping rule must state its missing behavior. Use header names, never column letters. Preserve internal nulls until export; apply one approved display placeholder only at the output boundary.
 
-Do not use column positions as meaning. Always map by confirmed header name.
+### Supported mapping patterns
+
+Full-pool source rules may use:
+
+- `sequence`: temporary draft sequence;
+- `constant`;
+- `column`;
+- `column_or_missing`;
+- `coalesce_columns`;
+- `missing`.
+
+Clean rules may additionally use:
+
+- `conditional`: ordered cases with a default rule.
+
+Use conditional rules for source/stage-dependent values such as License Holder. Do not encode such logic as a manual afterthought.
 
 ## 3. Draft and candidate generation
 
 ### Combined draft
 
 - Place listed rows first and clinical rows second.
-- Assign temporary sequential molecule IDs across both sections.
-- Track a source label in hidden workflow metadata. Add a visible source field only when it belongs to the approved Run Schema.
-- Fill unavailable source-specific fields with the configured export placeholder; never replace real `0` or `False`.
-- Keep copied raw listed and clinical sheets.
-- Use static values in the combined main sheet.
+- Use static cached values for the mapped draft; retain formula expressions only on raw audit sheets.
+- Assign temporary sequential IDs for candidate review.
+- Track source label, source row ID, original row number, input hash, and run fingerprint in hidden metadata.
+- Include visible `数据来源` when the approved full schema requests it.
+- Fill unavailable source-specific values with the configured export placeholder without replacing real `0` or `False`.
+- Verify copied raw-sheet value/formula fingerprints against the original input sheets.
 
 Required arithmetic:
 
 ```text
-draft data rows = listed input rows + clinical input rows
+draft rows = listed input rows + clinical input rows
 ```
 
 ### Candidate generation
 
-Generate candidates with high recall. Matching tiers are:
+Generate high-recall candidates in this order:
 
 1. normalized clinical asset equals a listed product or generic name;
-2. normalized base names agree after non-destructive dosage-form handling;
+2. base names agree after conservative dosage-form handling;
 3. component sets overlap;
-4. names are similar enough to warrant review;
+4. names are sufficiently similar for review;
 5. no direct candidate.
 
-Normalization may harmonize whitespace, punctuation, full-width characters, and separators. Do not silently remove salt, stereochemistry, controlled/extended-release, or component information. Those differences are review signals.
+Normalization may harmonize whitespace, punctuation, width, and separators. Preserve salt, stereochemistry, release form, fixed-combination, and component differences as review signals.
 
-One clinical row may create several candidate rows. All final counts and actions must be grouped by the unique clinical source row, not the candidate-row count.
+One clinical row may yield several candidate rows. Bind the candidate workbook and any decision JSON to one candidate fingerprint calculated from immutable candidate columns.
 
-## 4. Decision order and matrix
+## 4. Decision matrix
 
 Evaluate in this order:
 
@@ -104,90 +126,132 @@ in scope
 → same asset/components
 → same dosage form
 → same Disease
-→ indication evidence for a real new Disease
+→ indication evidence for a true new Disease
 → material chemical/release-form difference
 → marketed-pool coverage gap
 ```
 
 | Scenario | Required check | Default result |
 |---|---|---|
-| Same asset, form, Disease | Indications are the same class/subset/population | Delete clinical row; listed row carries it |
-| Same asset/form, different Disease | Mapping error versus true new indication | Correct and delete if same; retain if truly new Disease |
-| Same asset/Disease, different form | Dosage-form difference is real | Retain as potential formulation innovation |
-| Same asset, different form and Disease | Check Disease first, then form | Retain when either difference is real |
-| Partial component overlap | New research molecule or fixed product exists | Retain the complete clinical asset name |
-| Only already-listed drugs used together, no fixed product | Regimen rather than asset | Exclude |
+| Same asset, form, Disease | Indications are equivalent, subset, or population expression | Delete clinical row; listed row carries it |
+| Same asset/form, different Disease | Mapping difference versus true new indication | Correct/delete if equivalent; retain if a real new Disease |
+| Same asset/Disease, different form | Form difference is real | Retain as a formulation opportunity |
+| Same asset, different form and Disease | Check Disease then form | Retain when either difference is real |
+| Partial component overlap | A new research molecule or fixed product exists | Retain the complete clinical asset name |
+| Only already-listed drugs used together | No fixed product and no new molecule | Exclude as a regimen |
 | Salt/stereoisomer/free acid/ester/release difference | Difference changes asset identity | Retain or confirm; never auto-delete |
-| Diagnostic, imaging, or testing-only asset | No treatment purpose | Exclude |
-| Clinical-only therapeutic asset | Belongs to target TA | Retain |
-| Marketed stage but no listed-pool candidate | First launch, form, and approved indication | Follow marketed-gap rule below |
+| Diagnostic/testing/imaging asset | No therapeutic purpose | Exclude |
+| Clinical-only therapeutic asset | Belongs to the target TA | Retain |
+| Marketed stage but no listed candidate | Launch/form/approved-indication context | Apply marketed-gap review; do not auto-delete |
+
+### Evidence that is not decisive alone
+
+Do not keep/delete solely because:
+
+- registration numbers differ or match;
+- sponsors, holders, or groups differ or match;
+- trial titles differ or look similar;
+- target order differs;
+- project stage says `已上市`;
+- launch information is absent;
+- asset names are similar.
+
+Target order may be normalized as identity evidence, but target equality does not replace asset/form/Disease analysis. Distinct molecules remain distinct even when companies, targets, or Diseases overlap.
 
 ### Disease and indication
 
-- Treat Disease as the final classification and related indication as its main checking evidence.
-- Different Disease labels do not prove a new opportunity; compare the indications.
-- When indications are equivalent and only mapping differs, correct Disease and reclassify.
-- When indication evidence shows a true new Disease, retain the clinical row even for the same asset/form.
-- Keep an upstream Disease for outcome/risk descriptions unless a clear contradiction supports a targeted correction.
+- Treat Disease as the classification and indication text as the primary checking evidence.
+- Different Disease labels do not prove a new opportunity.
+- Correct a targeted Mapping error only through the approved correction field.
+- Retain a true new Disease even for the same asset and form.
 
-### Asset combinations
+### Combinations and background therapy
 
 - Retain a stable fixed combination as an independent asset.
-- Retain any row containing a new research molecule, including the full source main-drug name with background therapy.
-- Exclude a regimen made only from already-listed drugs when it is not a fixed product and contains no new molecule.
+- Retain any row containing a new research molecule and preserve its complete main-drug expression.
+- Exclude a regimen composed only of already-listed drugs when it is neither a fixed product nor a new molecule.
 
 ### Marketed stage with no listed candidate
 
-Do not auto-delete. Check:
+Check therapeutic purpose, China first launch against scope, marketed form, approved indications, and new molecule/fixed-combination/formulation evidence. Exclude only when the asset predates scope and adds no new Disease, form, asset, or fixed-product value. Missing marketed information is a data-completion issue, not a merge decision.
 
-1. therapeutic versus non-therapeutic purpose;
-2. China first-launch date against the run scope;
-3. marketed dosage form;
-4. approved indications versus the clinical Disease;
-5. new molecule/fixed combination/formulation evidence.
+## 5. Full baseline
 
-Exclude only when the asset was marketed before the run window and the clinical row adds no new Disease, dosage form, molecule, or fixed-product value. Retain a true new Disease/form/asset. Use `HOLD` only as an intermediate state when evidence is missing.
-
-Do not copy trial registration, sponsor, or status data into the listed carrier row after a duplicate decision. Preserve that evidence in the relation and raw sheets.
-
-## 5. Concentrated confirmation
-
-Resolve clear rows first. Batch only material uncertainties:
-
-- A: keep or change an ambiguous upstream Disease;
-- B: independent chemical form or naming variant;
-- C: fixed combination or regimen only;
-- D: outcome/risk description and upstream Disease;
-- E: new molecule plus background therapy naming;
-- F: marketed-pool coverage gap.
-
-For each item report the clinical source ID, candidates, form/Disease/indication comparison, known facts, open question, recommendation, and effect.
-
-Research only when a small missing fact can close the item. Prefer professional or regulatory sources for launch and approved-indication facts. Record source, date, query, supported conclusion, and affected source row.
-
-## 6. Finalization and QC
-
-Require one action per unique clinical row and zero Pending/HOLD. Keep all listed rows unless an upstream defect is returned to the source process. Apply only structured correction values, not free-text advice.
-
-Final arithmetic:
+Require one closed action per unique clinical source row and zero Pending/HOLD groups. Keep all valid listed rows. Apply only structured correction values.
 
 ```text
-final rows
+full rows
 = listed input rows
 + clinical input rows
 - unique clinical rows covered by listed rows
 - unique excluded clinical rows
 ```
 
-Final workbook requirements:
+The generated full pool must:
 
-- `最终分子池` uses the approved Run Schema and static values.
-- `跨库关系判断` retains candidates, decisions, evidence, actions, carriers, and final mappings.
-- raw listed and clinical sheets retain their original cell values/formulas and order.
-- final sequence is exactly `1..K`.
-- every kept clinical row has a final sequence; deleted/excluded rows do not.
-- every listed-covered deletion points to one or more valid listed carriers.
-- one-to-many candidates have one consistent clinical-row action.
-- no trailing formatted blank rows remain in the final pool.
+- use exactly the approved `wide_schema`;
+- contain static values;
+- assign final sequence `1..K` once and never renumber it later;
+- preserve source provenance in visible fields or hidden metadata;
+- map each kept clinical row to one final sequence;
+- map deleted/excluded clinical rows to no final sequence;
+- preserve relation decisions and raw source audit sheets;
+- store input, config, run, candidate, and full fingerprints in the hidden manifest.
 
-Treat any cardiovascular regression fixture as a script test only. Do not load its counts or decisions as rules for another TA.
+The full pool is now the sole fact baseline. Any later manual or imported update must target it first by locked final ID.
+
+## 6. Parallel post-baseline work
+
+After the full baseline, allow these branches to proceed independently:
+
+```text
+                 ┌─ Working Clean
+Full baseline ───┼─ marketed-information supplement
+                 └─ downstream ownership/MOA/company modules
+```
+
+The supplement branch is not a hard prerequisite for Working Clean. It is a closure requirement only when the run defines it as required for Final Clean.
+
+When supplement data return:
+
+1. match by locked full ID only;
+2. update the full pool first;
+3. reject blanks as overwrite values;
+4. reject a conflict with an existing valid value unless explicit overwrite approval is supplied;
+5. store one closed status per candidate;
+6. mark any existing Clean stale;
+7. regenerate Clean from the updated full pool.
+
+Review downstream modules selectively:
+
+- holder/group changes may affect company ownership and TA-leading-company results;
+- target/MOA changes may affect MOA overlap;
+- name, launch date, or packaging changes usually require only Full/Clean synchronization;
+- unchanged module-driving fields do not justify a full rerun.
+
+## 7. Clean derivation and final QC
+
+### Working Clean
+
+Permit generation whenever the full baseline exists and passes schema/ID checks. Disclose open supplement/module states in the command report and manifest. Append run-specific auxiliary columns only when configured.
+
+### Final Clean
+
+Require:
+
+- current full-pool fingerprint explicitly confirmed;
+- every required supplement candidate closed as `已补充`, `未查到`, `不适用`, or `经批准跳过`;
+- every required downstream module closed as `completed`, `not_applicable`, or `approved_skip`;
+- no stale Clean binding;
+- exact ID set and order agreement with the full pool;
+- exact approved Clean headers;
+- static values and no trailing formatted blank rows.
+
+License Holder must follow the approved conditional rule. The common pattern is:
+
+- listed source → holder;
+- active clinical source → sponsor;
+- clinical source already marketed with valid supplemented holder → holder;
+- marketed information not found → retain sponsor and retain `未查到` in the supplement audit state.
+
+Treat cardiovascular, kidney, and all other completed TA workbooks as regression fixtures only. Never reuse their counts, company lists, or decisions as defaults.

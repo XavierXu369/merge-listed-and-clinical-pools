@@ -24,6 +24,7 @@ except ImportError as exc:  # pragma: no cover - environment failure
 
 
 META_SHEET = "__workflow_meta"
+DEFAULT_SUPPLEMENT_AUDIT_SHEET = "__supplement_audit"
 RELATION_HEADERS = [
     "判断编号",
     "临床来源行ID",
@@ -65,6 +66,7 @@ RELATION_HEADERS = [
     "阶段执行结果",
     "最终分子序号",
 ]
+IMMUTABLE_RELATION_HEADERS = RELATION_HEADERS[:24]
 
 ALLOWED_ACTIONS = {
     "KEEP",
@@ -123,6 +125,50 @@ def load_json(path: str | Path) -> dict[str, Any]:
     return value
 
 
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def json_fingerprint(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def wide_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
+    schema = config.get("wide_schema")
+    if not isinstance(schema, list) or not schema:
+        raise ValueError("wide_schema must be a nonempty list.")
+    return schema
+
+
+def wide_fields(config: dict[str, Any]) -> dict[str, str]:
+    fields = config.get("wide_fields")
+    if not isinstance(fields, dict):
+        raise ValueError("wide_fields must be an object.")
+    return fields
+
+
+def config_fingerprint(config: dict[str, Any]) -> str:
+    contract = json.loads(json.dumps(config, ensure_ascii=False))
+    for module in contract.get("downstream_modules", []):
+        module.pop("status", None)
+    return json_fingerprint(contract)
+
+
+def run_fingerprint(config: dict[str, Any], listed_sha: str, clinical_sha: str) -> str:
+    return json_fingerprint(
+        {
+            "config": config_fingerprint(config),
+            "listed_sha256": listed_sha,
+            "clinical_sha256": clinical_sha,
+        }
+    )
+
+
 def require_new_output(output: str | Path, inputs: Iterable[str | Path] = ()) -> Path:
     out = Path(output).expanduser().resolve()
     if out.exists():
@@ -149,7 +195,7 @@ def clean_text(value: Any, missing: str = "—") -> str:
     if value is None:
         return ""
     text = str(value).strip()
-    if text in {"", missing, "-", "--"}:
+    if text in {"", missing, "-", "--", "—", "——"}:
         return ""
     return text
 
@@ -212,10 +258,27 @@ def records_from_sheet(ws) -> tuple[list[str], dict[str, int], list[dict[str, An
     return headers, mapping, records
 
 
-def sheet_fingerprint(ws) -> str:
+def records_with_cached_values(formula_ws, values_ws) -> tuple[list[str], dict[str, int], list[dict[str, Any]]]:
+    """Use formula-sheet row presence and cached values for static mapped outputs."""
+    headers, mapping = header_map(formula_ws)
+    last_row, _ = used_bounds(formula_ws)
+    records: list[dict[str, Any]] = []
+    for row_number in range(2, last_row + 1):
+        formula_values = [formula_ws.cell(row_number, col).value for col in range(1, len(headers) + 1)]
+        if all(is_blank(value) for value in formula_values):
+            continue
+        cached_values = [values_ws.cell(row_number, col).value for col in range(1, len(headers) + 1)]
+        record = {header: cached_values[index] for index, header in enumerate(headers)}
+        record["__row_number__"] = row_number
+        records.append(record)
+    return headers, mapping, records
+
+
+def sheet_fingerprint(ws, include_title: bool = True) -> str:
     last_row, last_col = used_bounds(ws)
     digest = hashlib.sha256()
-    digest.update(ws.title.encode("utf-8"))
+    if include_title:
+        digest.update(ws.title.encode("utf-8"))
     for row in range(1, last_row + 1):
         for col in range(1, last_col + 1):
             cell = ws.cell(row, col)
@@ -243,28 +306,71 @@ def formula_stats(ws) -> tuple[int, int]:
     return formulas, external
 
 
+def validate_mapping_rule(rule: Any, label: str, allow_conditional: bool = False) -> None:
+    if not isinstance(rule, dict):
+        raise ValueError(f"Mapping rule must be an object: {label}")
+    valid_modes = {"sequence", "constant", "column", "column_or_missing", "coalesce_columns", "missing"}
+    if allow_conditional:
+        valid_modes.add("conditional")
+    mode = rule.get("mode")
+    if mode not in valid_modes:
+        raise ValueError(f"Invalid mapping mode for {label}: {mode}")
+    if mode in {"column", "column_or_missing"} and not clean_text(rule.get("column"), missing=""):
+        raise ValueError(f"Column mapping lacks a column name: {label}")
+    if mode == "coalesce_columns":
+        columns = rule.get("columns")
+        if not isinstance(columns, list) or not columns or any(not clean_text(column, missing="") for column in columns):
+            raise ValueError(f"Coalesced mapping needs nonempty columns: {label}")
+    if mode == "conditional":
+        cases = rule.get("cases")
+        if not isinstance(cases, list) or not cases:
+            raise ValueError(f"Conditional mapping needs cases: {label}")
+        for index, case in enumerate(cases, start=1):
+            if not isinstance(case, dict) or not isinstance(case.get("when"), dict):
+                raise ValueError(f"Conditional case lacks a condition: {label} case {index}")
+            validate_mapping_rule(case.get("rule"), f"{label} case {index}", allow_conditional=False)
+        validate_mapping_rule(rule.get("default"), f"{label} default", allow_conditional=False)
+
+
+def condition_references(condition: dict[str, Any]) -> set[str]:
+    if "all" in condition:
+        return set().union(*(condition_references(item) for item in condition["all"]))
+    if "any" in condition:
+        return set().union(*(condition_references(item) for item in condition["any"]))
+    if "not" in condition:
+        return condition_references(condition["not"])
+    field = clean_text(condition.get("field"), missing="")
+    return {field} if field else set()
+
+
+def mapping_references(rule: dict[str, Any]) -> set[str]:
+    mode = rule.get("mode")
+    if mode in {"column", "column_or_missing"}:
+        return {rule["column"]}
+    if mode == "coalesce_columns":
+        return set(rule["columns"])
+    if mode == "conditional":
+        result = mapping_references(rule["default"])
+        for case in rule["cases"]:
+            result |= condition_references(case["when"])
+            result |= mapping_references(case["rule"])
+        return result
+    return set()
+
+
 def validate_config_shape(config: dict[str, Any]) -> None:
-    for section in ("listed", "clinical", "output", "final_fields", "run_schema"):
+    for section in ("listed", "clinical", "output", "wide_fields", "wide_schema", "clean_schema"):
         if section not in config:
             raise ValueError(f"Config is missing section: {section}")
-    if not isinstance(config["run_schema"], list) or not config["run_schema"]:
-        raise ValueError("run_schema must be a nonempty list.")
-    names = [item.get("name") for item in config["run_schema"]]
-    if any(not name for name in names) or len(names) != len(set(names)):
-        raise ValueError("Run Schema field names must be nonblank and unique.")
-    valid_modes = {"sequence", "constant", "column", "column_or_missing", "coalesce_columns", "missing"}
-    for item in config["run_schema"]:
+    schema = wide_schema(config)
+    names = [item.get("name") for item in schema]
+    if any(not clean_text(name, missing="") for name in names) or len(names) != len(set(names)):
+        raise ValueError("wide_schema field names must be nonblank and unique.")
+    for item in schema:
         for source in ("listed", "clinical"):
-            rule = item.get(source)
-            if not isinstance(rule, dict) or rule.get("mode") not in valid_modes:
-                raise ValueError(f"Invalid {source} mapping rule for field: {item.get('name')}")
-            if rule["mode"] in {"column", "column_or_missing"} and not rule.get("column"):
-                raise ValueError(f"Column mapping lacks a column name: {item.get('name')} / {source}")
-            if rule["mode"] == "coalesce_columns":
-                columns = rule.get("columns")
-                if not isinstance(columns, list) or not columns or any(not clean_text(column, missing="") for column in columns):
-                    raise ValueError(f"Coalesced mapping needs a nonempty columns list: {item.get('name')} / {source}")
-    final_names = set(names)
+            validate_mapping_rule(item.get(source), f"wide_schema {item.get('name')} / {source}")
+
+    fields = wide_fields(config)
     required_logical_fields = {
         "sequence",
         "asset",
@@ -279,12 +385,66 @@ def validate_config_shape(config: dict[str, Any]) -> None:
         "dosage_form",
         "group",
     }
-    missing_logical_fields = sorted(required_logical_fields - set(config["final_fields"]))
+    missing_logical_fields = sorted(required_logical_fields - set(fields))
     if missing_logical_fields:
-        raise ValueError("final_fields is missing logical fields: " + ", ".join(missing_logical_fields))
-    for logical, field in config["final_fields"].items():
-        if field not in final_names:
-            raise ValueError(f"final_fields.{logical} points outside Run Schema: {field}")
+        raise ValueError("wide_fields is missing logical fields: " + ", ".join(missing_logical_fields))
+    wide_names = set(names)
+    for logical, field in fields.items():
+        if field and field not in wide_names:
+            raise ValueError(f"wide_fields.{logical} points outside wide_schema: {field}")
+
+    clean_items = config.get("clean_schema")
+    auxiliary_items = config.get("clean_auxiliary_schema", [])
+    if not isinstance(clean_items, list) or not clean_items:
+        raise ValueError("clean_schema must be a nonempty list.")
+    if not isinstance(auxiliary_items, list):
+        raise ValueError("clean_auxiliary_schema must be a list.")
+    clean_names = [item.get("name") for item in clean_items + auxiliary_items]
+    if any(not clean_text(name, missing="") for name in clean_names) or len(clean_names) != len(set(clean_names)):
+        raise ValueError("Clean field names must be nonblank and unique across core and auxiliary schemas.")
+    for item in clean_items + auxiliary_items:
+        rule = {key: value for key, value in item.items() if key != "name"}
+        validate_mapping_rule(rule, f"clean field {item.get('name')}", allow_conditional=True)
+        unknown_references = sorted(mapping_references(rule) - wide_names)
+        if unknown_references:
+            raise ValueError(f"Clean field {item.get('name')} references fields outside wide_schema: {unknown_references}")
+
+    output = config["output"]
+    for key in ("draft_sheet", "relation_sheet", "full_sheet", "clean_sheet", "listed_source_value", "clinical_source_value"):
+        if not clean_text(output.get(key), missing=""):
+            raise ValueError(f"output.{key} is required.")
+    sheet_names = [output["draft_sheet"], output["relation_sheet"], output["full_sheet"], output["clean_sheet"], config["listed"]["raw_output_sheet"], config["clinical"]["raw_output_sheet"]]
+    if len(sheet_names) != len(set(sheet_names)):
+        raise ValueError("Configured output sheet names must be unique.")
+
+    supplement = config.get("supplement", {})
+    if supplement.get("enabled"):
+        for key in ("template_sheet", "id_field", "status_field", "open_status", "closed_statuses", "trigger", "target_fields"):
+            if key not in supplement:
+                raise ValueError(f"supplement.{key} is required when supplementation is enabled.")
+        if supplement["id_field"] not in wide_names:
+            raise ValueError("supplement.id_field must exist in wide_schema.")
+        for field in supplement.get("context_fields", []) + supplement.get("target_fields", []):
+            if field not in wide_names:
+                raise ValueError(f"Supplement field points outside wide_schema: {field}")
+        unknown_trigger_fields = sorted(condition_references(supplement["trigger"]) - wide_names)
+        if unknown_trigger_fields:
+            raise ValueError(f"Supplement trigger references fields outside wide_schema: {unknown_trigger_fields}")
+        if not isinstance(supplement["closed_statuses"], list) or not supplement["closed_statuses"]:
+            raise ValueError("supplement.closed_statuses must be a nonempty list.")
+
+    modules = config.get("downstream_modules", [])
+    if not isinstance(modules, list):
+        raise ValueError("downstream_modules must be a list.")
+    allowed_module_statuses = {"pending", "completed", "not_applicable", "approved_skip"}
+    for module in modules:
+        if not isinstance(module, dict) or not clean_text(module.get("name"), missing=""):
+            raise ValueError("Every downstream module needs a name.")
+        if module.get("status", "pending") not in allowed_module_statuses:
+            raise ValueError(f"Invalid downstream module status: {module.get('name')}")
+        unknown_affected = sorted(set(module.get("affected_by", [])) - wide_names)
+        if unknown_affected:
+            raise ValueError(f"Module {module.get('name')} affected_by fields are outside wide_schema: {unknown_affected}")
 
 
 def source_required_fields(config: dict[str, Any], source: str) -> list[str]:
@@ -296,7 +456,7 @@ def source_required_fields(config: dict[str, Any], source: str) -> list[str]:
     source_id = section.get("source_id", "")
     if source_id:
         required.append(source_id)
-    for item in config["run_schema"]:
+    for item in wide_schema(config):
         rule = item[source]
         if rule["mode"] == "column":
             required.append(rule["column"])
@@ -322,7 +482,7 @@ def inspect_one_source(config: dict[str, Any], source: str) -> tuple[dict[str, A
         return {"file": str(path), "sheet": sheet_name, "readable": False}, blockers + [str(exc)]
     missing_required = [field for field in source_required_fields(config, source) if field not in headers]
     blockers.extend(f"{source} missing required field: {field}" for field in missing_required)
-    for item in config["run_schema"]:
+    for item in wide_schema(config):
         rule = item[source]
         if rule["mode"] == "coalesce_columns" and not any(column in headers for column in rule["columns"]):
             blockers.append(
@@ -380,6 +540,23 @@ def inspect_one_source(config: dict[str, Any], source: str) -> tuple[dict[str, A
             if field in headers:
                 status_counts[field] = dict(Counter(clean_text(record.get(field)) for record in records))
     formulas, external = formula_stats(ws)
+    cached_missing = 0
+    cached_missing_required = 0
+    if formulas:
+        values_wb = load_workbook(path, data_only=True, read_only=False)
+        values_ws = values_wb[sheet_name]
+        required_columns = {mapping[field] for field in source_required_fields(config, source) if field in mapping}
+        last_formula_row, last_formula_col = used_bounds(ws)
+        for row in range(2, last_formula_row + 1):
+            for col in range(1, last_formula_col + 1):
+                value = ws.cell(row, col).value
+                if isinstance(value, str) and value.startswith("=") and values_ws.cell(row, col).value is None:
+                    cached_missing += 1
+                    if col in required_columns:
+                        cached_missing_required += 1
+        values_wb.close()
+    if cached_missing_required:
+        blockers.append(f"{source} has {cached_missing_required} required mapped formula cells without cached values")
     last_row, last_col = used_bounds(ws)
     result = {
         "file": str(path.resolve()),
@@ -401,6 +578,9 @@ def inspect_one_source(config: dict[str, Any], source: str) -> tuple[dict[str, A
         "status_counts": status_counts,
         "formula_cells": formulas,
         "potential_external_formula_cells": external,
+        "formula_cells_without_cached_values": cached_missing,
+        "required_formula_cells_without_cached_values": cached_missing_required,
+        "file_sha256": file_sha256(path),
         "fingerprint": sheet_fingerprint(ws),
     }
     return result, blockers
@@ -410,13 +590,17 @@ def inspect_config(config: dict[str, Any]) -> dict[str, Any]:
     validate_config_shape(config)
     listed, listed_blockers = inspect_one_source(config, "listed")
     clinical, clinical_blockers = inspect_one_source(config, "clinical")
-    run_schema = [item["name"] for item in config["run_schema"]]
+    run_schema = [item["name"] for item in wide_schema(config)]
     return {
         "state": "PREFLIGHT_PASSED" if not (listed_blockers + clinical_blockers) else "PREFLIGHT_FAILED",
         "ta_name": config.get("ta_name"),
         "schema_approved": bool(config.get("schema_approved")),
-        "run_schema_field_count": len(run_schema),
-        "run_schema": run_schema,
+        "wide_schema_field_count": len(run_schema),
+        "wide_schema": run_schema,
+        "clean_schema_field_count": len(config["clean_schema"]),
+        "clean_schema": [item["name"] for item in config["clean_schema"]],
+        "clean_auxiliary_field_count": len(config.get("clean_auxiliary_schema", [])),
+        "config_fingerprint": config_fingerprint(config),
         "listed": listed,
         "clinical": clinical,
         "blockers": listed_blockers + clinical_blockers,
@@ -454,6 +638,13 @@ def copy_sheet(source_ws, target_wb, target_name: str):
     target.freeze_panes = source_ws.freeze_panes
     target.auto_filter.ref = source_ws.auto_filter.ref
     target.sheet_view.showGridLines = source_ws.sheet_view.showGridLines
+    target.sheet_properties = copy(source_ws.sheet_properties)
+    target.sheet_format = copy(source_ws.sheet_format)
+    target.page_margins = copy(source_ws.page_margins)
+    target.page_setup = copy(source_ws.page_setup)
+    target.print_options = copy(source_ws.print_options)
+    target.data_validations = copy(source_ws.data_validations)
+    target.conditional_formatting = copy(source_ws.conditional_formatting)
     return target
 
 
@@ -502,6 +693,40 @@ def mapped_value(rule: dict[str, Any], record: dict[str, Any], sequence: int, mi
     return display_value(record.get(column), missing)
 
 
+def set_meta_value(ws, key: str, value: Any) -> None:
+    last_row = max(used_bounds(ws)[0], 1)
+    for row in range(1, last_row + 1):
+        if clean_text(ws.cell(row, 6).value, missing="") == key:
+            ws.cell(row, 7).value = value
+            return
+    row = last_row + 1
+    ws.cell(row, 6).value = key
+    ws.cell(row, 7).value = value
+
+
+def meta_values(ws) -> dict[str, str]:
+    result: dict[str, str] = {}
+    last_row = max(used_bounds(ws)[0], 1)
+    for row in range(1, last_row + 1):
+        key = clean_text(ws.cell(row, 6).value, missing="")
+        if key:
+            result[key] = clean_text(ws.cell(row, 7).value, missing="")
+    return result
+
+
+def require_matching_run(config: dict[str, Any], meta: dict[str, str]) -> None:
+    expected_config = config_fingerprint(config)
+    if meta.get("config_fingerprint") != expected_config:
+        raise ValueError("Run config fingerprint differs from the workbook manifest.")
+    for source in ("listed", "clinical"):
+        path = Path(config[source]["file"])
+        if not path.is_file():
+            raise ValueError(f"Configured {source} input is no longer available: {path}")
+        expected_sha = meta.get(f"{source}_input_sha256")
+        if expected_sha and file_sha256(path) != expected_sha:
+            raise ValueError(f"Configured {source} input SHA-256 differs from the workbook manifest.")
+
+
 def command_inspect(args) -> None:
     config = load_json(args.config)
     emit(inspect_config(config))
@@ -519,16 +744,20 @@ def command_build_draft(args) -> None:
     output = require_new_output(args.output, [listed_path, clinical_path])
     listed_wb = load_workbook(listed_path, data_only=False)
     clinical_wb = load_workbook(clinical_path, data_only=False)
+    listed_values_wb = load_workbook(listed_path, data_only=True)
+    clinical_values_wb = load_workbook(clinical_path, data_only=True)
     listed_ws = listed_wb[config["listed"]["sheet"]]
     clinical_ws = clinical_wb[config["clinical"]["sheet"]]
-    listed_headers, _, listed_records = records_from_sheet(listed_ws)
-    clinical_headers, _, clinical_records = records_from_sheet(clinical_ws)
+    listed_values_ws = listed_values_wb[config["listed"]["sheet"]]
+    clinical_values_ws = clinical_values_wb[config["clinical"]["sheet"]]
+    _, _, listed_records = records_with_cached_values(listed_ws, listed_values_ws)
+    _, _, clinical_records = records_with_cached_values(clinical_ws, clinical_values_ws)
 
     wb = Workbook()
     wb.remove(wb.active)
     draft_name = config["output"]["draft_sheet"]
     draft = wb.create_sheet(draft_name)
-    run_schema = config["run_schema"]
+    run_schema = wide_schema(config)
     headers = [item["name"] for item in run_schema]
     draft.append(headers)
     meta = wb.create_sheet(META_SHEET)
@@ -549,16 +778,24 @@ def command_build_draft(args) -> None:
             meta.append([source_value, sequence, get_source_id(record, section, raw_name), record["__row_number__"]])
             sequence += 1
 
+    listed_original_fp = sheet_fingerprint(listed_ws, include_title=False)
+    clinical_original_fp = sheet_fingerprint(clinical_ws, include_title=False)
     listed_raw = copy_sheet(listed_ws, wb, config["listed"]["raw_output_sheet"])
     clinical_raw = copy_sheet(clinical_ws, wb, config["clinical"]["raw_output_sheet"])
-    meta["F1"] = "state"
-    meta["G1"] = "DRAFT_BUILT"
-    meta["F2"] = "listed_raw_fingerprint"
-    meta["G2"] = sheet_fingerprint(listed_raw)
-    meta["F3"] = "clinical_raw_fingerprint"
-    meta["G3"] = sheet_fingerprint(clinical_raw)
-    meta["F4"] = "run_schema"
-    meta["G4"] = json.dumps(headers, ensure_ascii=False)
+    listed_sha = file_sha256(listed_path)
+    clinical_sha = file_sha256(clinical_path)
+    set_meta_value(meta, "state", "DRAFT_BUILT")
+    set_meta_value(meta, "skill_version", str(config.get("skill_version", "2.0")))
+    set_meta_value(meta, "config_fingerprint", config_fingerprint(config))
+    set_meta_value(meta, "run_fingerprint", run_fingerprint(config, listed_sha, clinical_sha))
+    set_meta_value(meta, "listed_input_sha256", listed_sha)
+    set_meta_value(meta, "clinical_input_sha256", clinical_sha)
+    set_meta_value(meta, "listed_raw_fingerprint", listed_original_fp)
+    set_meta_value(meta, "clinical_raw_fingerprint", clinical_original_fp)
+    set_meta_value(meta, "wide_schema", json.dumps(headers, ensure_ascii=False))
+    set_meta_value(meta, "clean_schema", json.dumps([item["name"] for item in config["clean_schema"]], ensure_ascii=False))
+    set_meta_value(meta, "draft_fingerprint", sheet_fingerprint(draft))
+    set_meta_value(meta, "clean_state", "NOT_GENERATED")
     meta.sheet_state = "hidden"
     style_table(draft)
     wb.save(output)
@@ -566,13 +803,13 @@ def command_build_draft(args) -> None:
     verify = load_workbook(output, data_only=False)
     verify_draft = verify[draft_name]
     _, _, verify_rows = records_from_sheet(verify_draft)
-    listed_fp = sheet_fingerprint(verify[config["listed"]["raw_output_sheet"]])
-    clinical_fp = sheet_fingerprint(verify[config["clinical"]["raw_output_sheet"]])
+    listed_fp = sheet_fingerprint(verify[config["listed"]["raw_output_sheet"]], include_title=False)
+    clinical_fp = sheet_fingerprint(verify[config["clinical"]["raw_output_sheet"]], include_title=False)
     expected = len(listed_records) + len(clinical_records)
     if len(verify_rows) != expected:
         output.unlink(missing_ok=True)
         raise ValueError("Draft row-count verification failed.")
-    if listed_fp != meta["G2"].value or clinical_fp != meta["G3"].value:
+    if listed_fp != listed_original_fp or clinical_fp != clinical_original_fp:
         output.unlink(missing_ok=True)
         raise ValueError("Raw-sheet fingerprint verification failed after draft generation.")
     emit(
@@ -582,11 +819,16 @@ def command_build_draft(args) -> None:
             "listed_rows": len(listed_records),
             "clinical_rows": len(clinical_records),
             "draft_rows": len(verify_rows),
-            "run_schema_fields": len(headers),
-            "raw_sheets_preserved": True,
+            "wide_schema_fields": len(headers),
+            "clean_schema_fields": len(config["clean_schema"]),
+            "config_fingerprint": config_fingerprint(config),
+            "run_fingerprint": run_fingerprint(config, listed_sha, clinical_sha),
+            "raw_sheet_cell_formula_fingerprints_preserved": True,
             "hidden_meta_sheet": META_SHEET,
         }
     )
+    listed_values_wb.close()
+    clinical_values_wb.close()
 
 
 def normalize_name(value: Any, missing: str) -> str:
@@ -771,12 +1013,16 @@ def command_build_candidates(args) -> None:
         raise ValueError(f"Relation sheet already exists: {relation_name}")
     draft = wb[draft_name]
     headers, _, records = records_from_sheet(draft)
-    expected_headers = [item["name"] for item in config["run_schema"]]
+    expected_headers = [item["name"] for item in wide_schema(config)]
     if headers != expected_headers:
         output.unlink(missing_ok=True)
         raise ValueError("Draft headers do not equal the approved Run Schema.")
-    meta_map, _ = read_meta(wb[META_SHEET])
-    fields = config["final_fields"]
+    meta_map, meta_state = read_meta(wb[META_SHEET])
+    require_matching_run(config, meta_state)
+    if meta_state.get("draft_fingerprint") != sheet_fingerprint(draft):
+        output.unlink(missing_ok=True)
+        raise ValueError("Draft fingerprint differs from the workbook manifest.")
+    fields = wide_fields(config)
     sequence_field = fields["sequence"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
@@ -846,7 +1092,9 @@ def command_build_candidates(args) -> None:
             relation.append(row)
 
     style_table(relation, header_fill="7030A0")
-    wb[META_SHEET]["G1"] = "RELATIONS_BUILT"
+    candidate_fp = candidate_fingerprint(relation)
+    set_meta_value(wb[META_SHEET], "state", "RELATIONS_BUILT")
+    set_meta_value(wb[META_SHEET], "candidate_fingerprint", candidate_fp)
     wb.save(output)
     emit(
         {
@@ -857,6 +1105,7 @@ def command_build_candidates(args) -> None:
             "candidate_rows": relation_rows,
             "one_to_many_clinical_rows": one_to_many,
             "initial_relation_types": dict(relation_counts),
+            "candidate_fingerprint": candidate_fp,
             "automatic_deletions": 0,
         }
     )
@@ -870,7 +1119,28 @@ def relation_header_map(ws) -> dict[str, int]:
     return mapping
 
 
+def candidate_fingerprint(ws) -> str:
+    mapping = relation_header_map(ws)
+    last_row, _ = used_bounds(ws)
+    digest = hashlib.sha256()
+    for header in IMMUTABLE_RELATION_HEADERS:
+        digest.update((header + "\n").encode("utf-8"))
+    for row in range(2, last_row + 1):
+        for header in IMMUTABLE_RELATION_HEADERS:
+            value = ws.cell(row, mapping[header]).value
+            if is_blank(value):
+                normalized = ""
+            elif isinstance(value, float) and value.is_integer():
+                normalized = str(int(value))
+            else:
+                normalized = str(value)
+            digest.update(f"{row}|{header}|{normalized}\n".encode("utf-8", errors="replace"))
+    return digest.hexdigest()
+
+
 def command_import_decisions(args) -> None:
+    config = load_json(args.config)
+    validate_config_shape(config)
     source = Path(args.workbook)
     if not source.is_file():
         raise ValueError(f"Candidate workbook was not found: {source}")
@@ -881,11 +1151,20 @@ def command_import_decisions(args) -> None:
         raise ValueError("Decision JSON must contain a decisions list.")
     shutil.copy2(source, output)
     wb = load_workbook(output, data_only=False)
-    relation_name = next((name for name in wb.sheetnames if name == "跨库关系判断"), None)
-    if relation_name is None:
+    relation_name = config["output"]["relation_sheet"]
+    if relation_name not in wb.sheetnames or META_SHEET not in wb.sheetnames:
         output.unlink(missing_ok=True)
-        raise ValueError("Relation sheet was not found.")
+        raise ValueError("Relation or workflow metadata sheet was not found.")
     ws = wb[relation_name]
+    meta = meta_values(wb[META_SHEET])
+    require_matching_run(config, meta)
+    current_candidate_fp = candidate_fingerprint(ws)
+    if meta.get("candidate_fingerprint") != current_candidate_fp:
+        output.unlink(missing_ok=True)
+        raise ValueError("Candidate fingerprint differs from the workbook manifest.")
+    if clean_text(payload.get("candidate_fingerprint"), missing="") != current_candidate_fp:
+        output.unlink(missing_ok=True)
+        raise ValueError("Decision JSON candidate_fingerprint does not match the workbook.")
     mapping = relation_header_map(ws)
     last_row, _ = used_bounds(ws)
     by_source: dict[str, list[int]] = defaultdict(list)
@@ -933,14 +1212,17 @@ def command_import_decisions(args) -> None:
                     ws.cell(row, mapping[relation_field]).value = decision[source_field]
             has_correction = bool(clean_text(decision.get("disease_correction"), "") or clean_text(decision.get("asset_name_correction"), ""))
             ws.cell(row, mapping["主表同步状态"]).value = "待同步" if has_correction else "无需修正"
-    wb[META_SHEET]["G1"] = "DECISIONS_PENDING"
-    wb.save(output)
     unique_sequences = set(by_sequence)
     pending = unique_sequences - assigned
+    final_state = "DECISIONS_CLOSED" if not pending else "DECISIONS_PENDING"
+    set_meta_value(wb[META_SHEET], "state", final_state)
+    set_meta_value(wb[META_SHEET], "decision_payload_fingerprint", json_fingerprint(payload))
+    wb.save(output)
     emit(
         {
-            "state": "DECISIONS_CLOSED" if not pending else "DECISIONS_PENDING",
+            "state": final_state,
             "output": str(output),
+            "candidate_fingerprint": current_candidate_fp,
             "unique_clinical_rows": len(unique_sequences),
             "decisions_imported": len(assigned),
             "pending_unique_clinical_rows": len(pending),
@@ -969,16 +1251,22 @@ def finalization_preview(config: dict[str, Any], workbook: str | Path) -> tuple[
     draft = wb[draft_name]
     relation = wb[relation_name]
     draft_headers, _, draft_records = records_from_sheet(draft)
-    expected_headers = [item["name"] for item in config["run_schema"]]
+    expected_headers = [item["name"] for item in wide_schema(config)]
     if draft_headers != expected_headers:
         raise ValueError("Draft headers do not equal the approved Run Schema.")
+    meta_map, meta_state = read_meta(wb[META_SHEET])
+    require_matching_run(config, meta_state)
+    if meta_state.get("draft_fingerprint") != sheet_fingerprint(draft):
+        raise ValueError("Draft fingerprint differs from the workbook manifest.")
+    current_candidate_fp = candidate_fingerprint(relation)
+    if meta_state.get("candidate_fingerprint") != current_candidate_fp:
+        raise ValueError("Candidate fingerprint differs from the workbook manifest.")
     relation_map = relation_header_map(relation)
     relation_last_row, _ = used_bounds(relation)
     groups: dict[str, list[int]] = defaultdict(list)
     for row in range(2, relation_last_row + 1):
         groups[stable_key(relation.cell(row, relation_map["临床分子序号"]).value)].append(row)
-    meta_map, _ = read_meta(wb[META_SHEET])
-    fields = config["final_fields"]
+    fields = wide_fields(config)
     sequence_field = fields["sequence"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
@@ -1037,6 +1325,8 @@ def finalization_preview(config: dict[str, Any], workbook: str | Path) -> tuple[
         "action_counts": dict(action_counts),
         "expected_final_rows": expected_final,
         "expected_final_source_counts": {listed_source: len(listed_records), clinical_source: keep},
+        "run_fingerprint": meta_state.get("run_fingerprint"),
+        "candidate_fingerprint": current_candidate_fp,
         "pending_or_errors": errors,
     }
     context = {
@@ -1079,7 +1369,7 @@ def count_formulas(ws) -> int:
     )
 
 
-def command_finalize(args) -> None:
+def command_finalize_full(args) -> None:
     config = load_json(args.config)
     validate_config_shape(config)
     if not config.get("schema_approved"):
@@ -1103,7 +1393,7 @@ def command_finalize(args) -> None:
     wb = load_workbook(output, data_only=False)
     draft_name = config["output"]["draft_sheet"]
     relation_name = config["output"]["relation_sheet"]
-    final_name = config["output"]["final_sheet"]
+    final_name = config["output"]["full_sheet"]
     if final_name in wb.sheetnames:
         output.unlink(missing_ok=True)
         raise ValueError(f"Final sheet already exists: {final_name}")
@@ -1123,12 +1413,12 @@ def command_finalize(args) -> None:
             "disease_correction": (unique_field_values(relation, rows, relation_map["Disease修正值"]) or [""])[0],
             "asset_correction": (unique_field_values(relation, rows, relation_map["资产名称修正值"]) or [""])[0],
         }
-    fields = config["final_fields"]
+    fields = wide_fields(config)
     sequence_field = fields["sequence"]
     listed_source = config["output"]["listed_source_value"]
     clinical_source = config["output"]["clinical_source_value"]
     meta_map, _ = read_meta(wb[META_SHEET])
-    headers = [item["name"] for item in config["run_schema"]]
+    headers = [item["name"] for item in wide_schema(config)]
     final_rows: list[tuple[dict[str, Any], int, str, str]] = []
     clinical_to_final: dict[str, int] = {}
     for record in draft_records:
@@ -1183,12 +1473,29 @@ def command_finalize(args) -> None:
     expected_listed_fp = meta_state.get("listed_raw_fingerprint", "")
     expected_clinical_fp = meta_state.get("clinical_raw_fingerprint", "")
     wb.remove(wb[draft_name])
-    wb.remove(wb[META_SHEET])
+    full_fp = sheet_fingerprint(final)
+    supplement_records = [record for record, _, _, _ in final_rows if supplement_condition_matches(config, record)]
+    supplement_enabled = bool(config.get("supplement", {}).get("enabled"))
+    supplement_state = "SUPPLEMENT_PENDING" if supplement_enabled and supplement_records else "SUPPLEMENT_NOT_APPLICABLE"
+    set_meta_value(wb[META_SHEET], "state", "FULL_BASELINE_LOCKED")
+    set_meta_value(wb[META_SHEET], "full_baseline_fingerprint", full_fp)
+    set_meta_value(wb[META_SHEET], "full_fingerprint", full_fp)
+    set_meta_value(wb[META_SHEET], "clean_state", "NOT_GENERATED")
+    set_meta_value(wb[META_SHEET], "clean_bound_full_fingerprint", "")
+    set_meta_value(wb[META_SHEET], "supplement_state", supplement_state)
+    set_meta_value(wb[META_SHEET], "supplement_candidate_count", len(supplement_records))
+    set_meta_value(
+        wb[META_SHEET],
+        "module_states",
+        json.dumps({item["name"]: item.get("status", "pending") for item in config.get("downstream_modules", [])}, ensure_ascii=False),
+    )
+    wb[META_SHEET].sheet_state = "hidden"
     desired = [
         final_name,
         relation_name,
         config["listed"]["raw_output_sheet"],
         config["clinical"]["raw_output_sheet"],
+        META_SHEET,
     ]
     if any(name not in wb.sheetnames for name in desired):
         output.unlink(missing_ok=True)
@@ -1196,7 +1503,7 @@ def command_finalize(args) -> None:
     extras = [name for name in wb.sheetnames if name not in desired]
     if extras:
         output.unlink(missing_ok=True)
-        raise ValueError(f"Unexpected sheets would violate the four-sheet output contract: {extras}")
+        raise ValueError(f"Unexpected sheets would violate the full-baseline output contract: {extras}")
     wb._sheets = [wb[name] for name in desired]
     wb.save(output)
 
@@ -1205,11 +1512,11 @@ def command_finalize(args) -> None:
     final_headers, _, final_records = records_from_sheet(final_ws)
     final_sequences = [record[sequence_field] for record in final_records]
     source_counts = Counter(source_value for _, _, _, source_value in final_rows)
-    listed_fp = sheet_fingerprint(verify[config["listed"]["raw_output_sheet"]])
-    clinical_fp = sheet_fingerprint(verify[config["clinical"]["raw_output_sheet"]])
+    listed_fp = sheet_fingerprint(verify[config["listed"]["raw_output_sheet"]], include_title=False)
+    clinical_fp = sheet_fingerprint(verify[config["clinical"]["raw_output_sheet"]], include_title=False)
     checks = {
         "sheet_order": verify.sheetnames == desired,
-        "run_schema": final_headers == headers,
+        "wide_schema": final_headers == headers,
         "final_rows": len(final_records) == preview["expected_final_rows"],
         "sequence": final_sequences == list(range(1, len(final_records) + 1)),
         "source_counts": dict(source_counts) == preview["expected_final_source_counts"],
@@ -1217,13 +1524,14 @@ def command_finalize(args) -> None:
         "clinical_raw_fingerprint": clinical_fp == expected_clinical_fp,
         "final_formula_cells": count_formulas(final_ws) == 0,
         "no_trailing_blank_rows": final_ws.max_row == len(final_records) + 1,
+        "full_fingerprint": sheet_fingerprint(final_ws) == full_fp,
     }
     if not all(checks.values()):
         output.unlink(missing_ok=True)
         raise ValueError("Final workbook QC failed: " + json.dumps(checks, ensure_ascii=False))
     emit(
         {
-            "state": "QC_PASSED",
+            "state": "FULL_QC_PASSED",
             "output": str(output),
             "listed_rows": preview["listed_rows"],
             "clinical_rows": preview["clinical_rows"],
@@ -1232,6 +1540,415 @@ def command_finalize(args) -> None:
             "final_source_counts": dict(source_counts),
             "final_sequence": f"1-{len(final_records)}",
             "pending": 0,
+            "supplement_state": supplement_state,
+            "supplement_candidate_count": len(supplement_records),
+            "full_fingerprint": full_fp,
+            "checks": checks,
+        }
+    )
+
+
+def condition_matches(condition: dict[str, Any], record: dict[str, Any], missing: str) -> bool:
+    if "all" in condition:
+        items = condition["all"]
+        if not isinstance(items, list):
+            raise ValueError("Condition 'all' must be a list.")
+        return all(condition_matches(item, record, missing) for item in items)
+    if "any" in condition:
+        items = condition["any"]
+        if not isinstance(items, list):
+            raise ValueError("Condition 'any' must be a list.")
+        return any(condition_matches(item, record, missing) for item in items)
+    if "not" in condition:
+        return not condition_matches(condition["not"], record, missing)
+    field = clean_text(condition.get("field"), missing="")
+    if not field:
+        raise ValueError("Leaf condition lacks a field.")
+    operation = condition.get("op", "eq")
+    raw = record.get(field)
+    actual = clean_text(raw, missing)
+    if operation == "has_value":
+        return bool(actual)
+    if operation == "is_blank":
+        return not actual
+    if operation == "eq":
+        return actual == clean_text(condition.get("value"), missing)
+    if operation == "ne":
+        return actual != clean_text(condition.get("value"), missing)
+    if operation in {"in", "not_in"}:
+        values = condition.get("values")
+        if not isinstance(values, list):
+            raise ValueError(f"Condition {operation} requires a values list.")
+        normalized = {clean_text(value, missing) for value in values}
+        result = actual in normalized
+        return result if operation == "in" else not result
+    if operation == "contains":
+        return clean_text(condition.get("value"), missing) in actual
+    raise ValueError(f"Unsupported condition operation: {operation}")
+
+
+def supplement_condition_matches(config: dict[str, Any], record: dict[str, Any]) -> bool:
+    supplement = config.get("supplement", {})
+    if not supplement.get("enabled"):
+        return False
+    return condition_matches(supplement["trigger"], record, config.get("missing_display", "—"))
+
+
+def clean_rule_value(rule: dict[str, Any], record: dict[str, Any], missing: str) -> Any:
+    mode = rule["mode"]
+    if mode == "constant":
+        return display_value(rule.get("value"), missing)
+    if mode == "missing":
+        return missing
+    if mode in {"column", "column_or_missing"}:
+        column = rule["column"]
+        if column not in record:
+            if mode == "column_or_missing":
+                return missing
+            raise ValueError(f"Required full-pool field is missing during Clean derivation: {column}")
+        return display_value(record.get(column), missing)
+    if mode == "coalesce_columns":
+        for column in rule["columns"]:
+            if column in record and not is_blank(record.get(column)) and clean_text(record.get(column), missing):
+                return record.get(column)
+        return missing
+    if mode == "conditional":
+        for case in rule["cases"]:
+            if condition_matches(case["when"], record, missing):
+                return clean_rule_value(case["rule"], record, missing)
+        return clean_rule_value(rule["default"], record, missing)
+    raise ValueError(f"Unsupported Clean mapping mode: {mode}")
+
+
+def load_full_context(config: dict[str, Any], workbook: str | Path):
+    path = Path(workbook)
+    if not path.is_file():
+        raise ValueError(f"Full-pool workbook was not found: {path}")
+    wb = load_workbook(path, data_only=False)
+    full_name = config["output"]["full_sheet"]
+    if full_name not in wb.sheetnames or META_SHEET not in wb.sheetnames:
+        raise ValueError("Workbook lacks the full-pool or workflow metadata sheet.")
+    full = wb[full_name]
+    headers, mapping, records = records_from_sheet(full)
+    expected_headers = [item["name"] for item in wide_schema(config)]
+    if headers != expected_headers:
+        raise ValueError("Full-pool headers differ from the approved wide_schema.")
+    meta = meta_values(wb[META_SHEET])
+    if meta.get("config_fingerprint") != config_fingerprint(config):
+        raise ValueError("Run config contract fingerprint differs from the full-pool manifest.")
+    sequence_field = wide_fields(config)["sequence"]
+    sequences = [record.get(sequence_field) for record in records]
+    if sequences != list(range(1, len(records) + 1)):
+        raise ValueError("Full-pool sequence is not the locked 1..K contract.")
+    if count_formulas(full):
+        raise ValueError("Full pool contains formulas; static values are required before supplement/Clean work.")
+    return wb, full, headers, mapping, records, meta, sheet_fingerprint(full)
+
+
+def module_state_map(config: dict[str, Any]) -> dict[str, str]:
+    return {item["name"]: item.get("status", "pending") for item in config.get("downstream_modules", [])}
+
+
+def command_build_supplement_template(args) -> None:
+    config = load_json(args.config)
+    validate_config_shape(config)
+    supplement = config.get("supplement", {})
+    if not supplement.get("enabled"):
+        raise ValueError("Supplementation is disabled in the run config.")
+    wb, _, _, _, records, _, full_fp = load_full_context(config, args.workbook)
+    output = require_new_output(args.output, [args.workbook])
+    candidates = [record for record in records if supplement_condition_matches(config, record)]
+    id_field = supplement["id_field"]
+    ids = [stable_key(record.get(id_field)) for record in candidates]
+    if any(not value for value in ids) or len(ids) != len(set(ids)):
+        raise ValueError("Supplement candidates contain blank or duplicate locked full IDs.")
+    context_fields = supplement.get("context_fields", [])
+    target_fields = supplement.get("target_fields", [])
+    status_field = supplement["status_field"]
+    note_field = supplement.get("note_field", "补充说明")
+    headers = []
+    for field in [id_field] + context_fields + target_fields + [status_field, note_field]:
+        if field not in headers:
+            headers.append(field)
+    out_wb = Workbook()
+    ws = out_wb.active
+    ws.title = supplement["template_sheet"]
+    ws.append(headers)
+    missing = config.get("missing_display", "—")
+    for record in candidates:
+        row = []
+        for header in headers:
+            if header == status_field:
+                row.append(supplement["open_status"])
+            elif header == note_field:
+                row.append("")
+            else:
+                value = record.get(header)
+                row.append("" if not clean_text(value, missing) else value)
+        ws.append(row)
+    style_table(ws, header_fill="548235")
+    meta_ws = out_wb.create_sheet("__supplement_meta")
+    meta_ws.append(["config_fingerprint", config_fingerprint(config)])
+    meta_ws.append(["source_full_fingerprint", full_fp])
+    meta_ws.append(["candidate_id_fingerprint", json_fingerprint(ids)])
+    meta_ws.append(["candidate_count", len(ids)])
+    meta_ws.sheet_state = "hidden"
+    out_wb.save(output)
+    verify = load_workbook(output, data_only=False)
+    _, _, verify_records = records_from_sheet(verify[supplement["template_sheet"]])
+    if len(verify_records) != len(candidates):
+        output.unlink(missing_ok=True)
+        raise ValueError("Supplement-template row verification failed.")
+    emit(
+        {
+            "state": "SUPPLEMENT_TEMPLATE_BUILT",
+            "output": str(output),
+            "candidate_count": len(candidates),
+            "locked_ids": ids,
+            "source_full_fingerprint": full_fp,
+            "target_fields": target_fields,
+        }
+    )
+    wb.close()
+
+
+def existing_supplement_audit(wb, sheet_name: str, id_field: str) -> dict[str, dict[str, Any]]:
+    if sheet_name not in wb.sheetnames:
+        return {}
+    _, _, records = records_from_sheet(wb[sheet_name])
+    result: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = stable_key(record.get(id_field))
+        if key:
+            result[key] = record
+    return result
+
+
+def command_apply_supplements(args) -> None:
+    config = load_json(args.config)
+    validate_config_shape(config)
+    supplement = config.get("supplement", {})
+    if not supplement.get("enabled"):
+        raise ValueError("Supplementation is disabled in the run config.")
+    source = Path(args.workbook)
+    supplement_path = Path(args.supplement)
+    if not supplement_path.is_file():
+        raise ValueError(f"Supplement workbook was not found: {supplement_path}")
+    output = require_new_output(args.output, [source, supplement_path])
+    shutil.copy2(source, output)
+    wb, full, _, full_mapping, full_records, meta, before_fp = load_full_context(config, output)
+    supp_wb = load_workbook(supplement_path, data_only=True)
+    template_sheet = supplement["template_sheet"]
+    if template_sheet not in supp_wb.sheetnames:
+        output.unlink(missing_ok=True)
+        raise ValueError(f"Supplement sheet was not found: {template_sheet}")
+    supp_headers, _, returned = records_from_sheet(supp_wb[template_sheet])
+    id_field = supplement["id_field"]
+    status_field = supplement["status_field"]
+    note_field = supplement.get("note_field", "补充说明")
+    target_fields = supplement.get("target_fields", [])
+    required_headers = [id_field, status_field] + target_fields
+    missing_headers = [field for field in required_headers if field not in supp_headers]
+    if missing_headers:
+        output.unlink(missing_ok=True)
+        raise ValueError("Supplement workbook lacks required fields: " + ", ".join(missing_headers))
+    returned_ids = [stable_key(record.get(id_field)) for record in returned]
+    if any(not value for value in returned_ids) or len(returned_ids) != len(set(returned_ids)):
+        output.unlink(missing_ok=True)
+        raise ValueError("Returned supplement IDs are blank or duplicated.")
+    candidates = [record for record in full_records if supplement_condition_matches(config, record)]
+    candidate_by_id = {stable_key(record.get(id_field)): record for record in candidates}
+    full_by_id = {stable_key(record.get(id_field)): record for record in full_records}
+    unknown = sorted(set(returned_ids) - set(candidate_by_id))
+    if unknown:
+        output.unlink(missing_ok=True)
+        raise ValueError(f"Supplement rows contain unknown/noncandidate locked IDs: {unknown}")
+    audit_sheet = supplement.get("audit_sheet", DEFAULT_SUPPLEMENT_AUDIT_SHEET)
+    prior_audit = existing_supplement_audit(wb, audit_sheet, id_field)
+    returned_by_id = {stable_key(record.get(id_field)): record for record in returned}
+    allowed_statuses = {supplement["open_status"], *supplement["closed_statuses"]}
+    missing = config.get("missing_display", "—")
+    changed_fields: set[str] = set()
+    changed_ids: set[str] = set()
+    final_statuses: dict[str, str] = {}
+    notes: dict[str, Any] = {}
+    for candidate_id, record in candidate_by_id.items():
+        returned_record = returned_by_id.get(candidate_id)
+        prior = prior_audit.get(candidate_id, {})
+        status = clean_text(
+            returned_record.get(status_field) if returned_record else prior.get(status_field),
+            missing,
+        ) or supplement["open_status"]
+        if status not in allowed_statuses:
+            output.unlink(missing_ok=True)
+            raise ValueError(f"Unsupported supplement status for ID {candidate_id}: {status}")
+        final_statuses[candidate_id] = status
+        notes[candidate_id] = (returned_record or prior).get(note_field, "")
+        if returned_record:
+            row_number = record["__row_number__"]
+            for field in target_fields:
+                incoming = returned_record.get(field)
+                if not clean_text(incoming, missing):
+                    continue
+                existing = full.cell(row_number, full_mapping[field]).value
+                if clean_text(existing, missing) and clean_text(existing, missing) != clean_text(incoming, missing) and not args.allow_overwrite:
+                    output.unlink(missing_ok=True)
+                    raise ValueError(f"Supplement would overwrite a valid value for ID {candidate_id}, field {field}.")
+                if clean_text(existing, missing) != clean_text(incoming, missing):
+                    full.cell(row_number, full_mapping[field]).value = incoming
+                    record[field] = incoming
+                    changed_fields.add(field)
+                    changed_ids.add(candidate_id)
+        if status == "已补充" and not any(clean_text(record.get(field), missing) for field in target_fields):
+            output.unlink(missing_ok=True)
+            raise ValueError(f"ID {candidate_id} is marked 已补充 but has no usable target-field value.")
+
+    if audit_sheet in wb.sheetnames:
+        wb.remove(wb[audit_sheet])
+    audit = wb.create_sheet(audit_sheet, len(wb.sheetnames) - 1)
+    audit_headers = []
+    for field in [id_field] + supplement.get("context_fields", []) + target_fields + [status_field, note_field]:
+        if field not in audit_headers:
+            audit_headers.append(field)
+    audit.append(audit_headers)
+    for record in candidates:
+        candidate_id = stable_key(record.get(id_field))
+        audit.append(
+            [
+                final_statuses[candidate_id] if field == status_field else notes[candidate_id] if field == note_field else record.get(field)
+                for field in audit_headers
+            ]
+        )
+    audit.sheet_state = "hidden"
+    closed_statuses = set(supplement["closed_statuses"])
+    pending_ids = sorted(candidate_id for candidate_id, status in final_statuses.items() if status not in closed_statuses)
+    supplement_state = "SUPPLEMENT_CLOSED" if not pending_ids else "SUPPLEMENT_PENDING"
+    after_fp = sheet_fingerprint(full)
+    affected_modules = []
+    for module in config.get("downstream_modules", []):
+        if changed_fields & set(module.get("affected_by", [])):
+            affected_modules.append(module["name"])
+    set_meta_value(wb[META_SHEET], "full_fingerprint", after_fp)
+    set_meta_value(wb[META_SHEET], "supplement_state", supplement_state)
+    set_meta_value(wb[META_SHEET], "supplement_candidate_count", len(candidates))
+    set_meta_value(wb[META_SHEET], "supplement_pending_count", len(pending_ids))
+    set_meta_value(wb[META_SHEET], "supplement_input_sha256", file_sha256(supplement_path))
+    if changed_fields and config["output"]["clean_sheet"] in wb.sheetnames:
+        set_meta_value(wb[META_SHEET], "clean_state", "CLEAN_STALE")
+    set_meta_value(wb[META_SHEET], "affected_modules_after_supplement", json.dumps(affected_modules, ensure_ascii=False))
+    wb[META_SHEET].sheet_state = "hidden"
+    wb.save(output)
+    verify = load_workbook(output, data_only=False)
+    if sheet_fingerprint(verify[config["output"]["full_sheet"]]) != after_fp:
+        output.unlink(missing_ok=True)
+        raise ValueError("Full-pool fingerprint verification failed after supplement application.")
+    emit(
+        {
+            "state": supplement_state,
+            "output": str(output),
+            "candidate_count": len(candidates),
+            "returned_count": len(returned),
+            "pending_count": len(pending_ids),
+            "pending_ids": pending_ids,
+            "changed_ids": sorted(changed_ids),
+            "changed_fields": sorted(changed_fields),
+            "affected_modules": affected_modules,
+            "full_fingerprint_before": before_fp,
+            "full_fingerprint_after": after_fp,
+            "clean_state": meta_values(verify[META_SHEET]).get("clean_state"),
+        }
+    )
+
+
+def command_derive_clean(args) -> None:
+    config = load_json(args.config)
+    validate_config_shape(config)
+    source = Path(args.workbook)
+    output = require_new_output(args.output, [source])
+    shutil.copy2(source, output)
+    wb, full, _, _, records, meta, full_fp = load_full_context(config, output)
+    stage = args.stage
+    supplement = config.get("supplement", {})
+    module_states = module_state_map(config)
+    blockers: list[str] = []
+    if stage == "final":
+        if not args.confirmed_current_full:
+            blockers.append("Final Clean requires --confirmed-current-full.")
+        if supplement.get("enabled") and supplement.get("required_for_final_clean"):
+            if meta.get("supplement_state") not in {"SUPPLEMENT_CLOSED", "SUPPLEMENT_NOT_APPLICABLE"}:
+                blockers.append(f"Required supplement state is open: {meta.get('supplement_state') or 'UNKNOWN'}")
+        closed_module_states = {"completed", "not_applicable", "approved_skip"}
+        for module in config.get("downstream_modules", []):
+            if module.get("required_for_final_clean") and module.get("status", "pending") not in closed_module_states:
+                blockers.append(f"Required downstream module is open: {module['name']}")
+    if blockers:
+        output.unlink(missing_ok=True)
+        raise ValueError("Clean derivation gate failed: " + " | ".join(blockers))
+
+    include_auxiliary = bool(args.include_auxiliary or config.get("include_clean_auxiliary_by_default", False))
+    if stage == "final" and not config.get("include_clean_auxiliary_in_final", False):
+        include_auxiliary = False
+    schema = list(config["clean_schema"])
+    if include_auxiliary:
+        schema.extend(config.get("clean_auxiliary_schema", []))
+    clean_name = config["output"]["clean_sheet"]
+    if clean_name in wb.sheetnames:
+        wb.remove(wb[clean_name])
+    full_index = wb.sheetnames.index(config["output"]["full_sheet"])
+    clean_ws = wb.create_sheet(clean_name, full_index + 1)
+    clean_headers = [item["name"] for item in schema]
+    clean_ws.append(clean_headers)
+    missing = config.get("missing_display", "—")
+    for record in records:
+        clean_ws.append([clean_rule_value({key: value for key, value in item.items() if key != "name"}, record, missing) for item in schema])
+    style_table(clean_ws, header_fill="2F75B5")
+    sequence_field = wide_fields(config)["sequence"]
+    if sequence_field not in clean_headers:
+        output.unlink(missing_ok=True)
+        raise ValueError(f"Clean schema must retain the locked sequence field: {sequence_field}")
+    _, _, clean_records = records_from_sheet(clean_ws)
+    full_ids = [record[sequence_field] for record in records]
+    clean_ids = [record[sequence_field] for record in clean_records]
+    if full_ids != clean_ids:
+        output.unlink(missing_ok=True)
+        raise ValueError("Full and Clean ID/order contract failed before save.")
+    clean_state = "CLEAN_FINAL" if stage == "final" else "CLEAN_WORKING"
+    set_meta_value(wb[META_SHEET], "state", clean_state)
+    set_meta_value(wb[META_SHEET], "full_fingerprint", full_fp)
+    set_meta_value(wb[META_SHEET], "clean_state", clean_state)
+    set_meta_value(wb[META_SHEET], "clean_bound_full_fingerprint", full_fp)
+    set_meta_value(wb[META_SHEET], "clean_schema_used", json.dumps(clean_headers, ensure_ascii=False))
+    set_meta_value(wb[META_SHEET], "module_states", json.dumps(module_states, ensure_ascii=False))
+    wb[META_SHEET].sheet_state = "hidden"
+    wb.save(output)
+    verify = load_workbook(output, data_only=False)
+    verify_full = verify[config["output"]["full_sheet"]]
+    verify_clean = verify[clean_name]
+    verify_clean_headers, _, verify_clean_records = records_from_sheet(verify_clean)
+    verify_clean_ids = [record[sequence_field] for record in verify_clean_records]
+    checks = {
+        "full_fingerprint": sheet_fingerprint(verify_full) == full_fp,
+        "clean_headers": verify_clean_headers == clean_headers,
+        "row_count": len(verify_clean_records) == len(records),
+        "id_order": verify_clean_ids == full_ids,
+        "clean_formula_cells": count_formulas(verify_clean) == 0,
+        "no_trailing_blank_rows": verify_clean.max_row == len(records) + 1,
+        "clean_bound_to_current_full": meta_values(verify[META_SHEET]).get("clean_bound_full_fingerprint") == full_fp,
+    }
+    if not all(checks.values()):
+        output.unlink(missing_ok=True)
+        raise ValueError("Clean workbook QC failed: " + json.dumps(checks, ensure_ascii=False))
+    emit(
+        {
+            "state": clean_state,
+            "output": str(output),
+            "full_rows": len(records),
+            "clean_rows": len(verify_clean_records),
+            "clean_fields": len(clean_headers),
+            "auxiliary_fields_included": include_auxiliary,
+            "supplement_state": meta.get("supplement_state"),
+            "module_states": module_states,
+            "full_fingerprint": full_fp,
             "checks": checks,
         }
     )
@@ -1258,18 +1975,48 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_parser.set_defaults(func=command_build_candidates)
 
     decision_parser = subparsers.add_parser("import-decisions", help="Import structured decisions into every candidate row in a clinical group.")
+    decision_parser.add_argument("--config", required=True)
     decision_parser.add_argument("--workbook", required=True)
     decision_parser.add_argument("--decisions", required=True)
     decision_parser.add_argument("--output", required=True)
     decision_parser.set_defaults(func=command_import_decisions)
 
-    final_parser = subparsers.add_parser("finalize", help="Preview or generate the final pool from closed decisions.")
+    final_parser = subparsers.add_parser("finalize-full", help="Preview or generate the authoritative full-pool baseline.")
     final_parser.add_argument("--mode", choices=("preview", "generate"), required=True)
     final_parser.add_argument("--config", required=True)
     final_parser.add_argument("--workbook", required=True)
     final_parser.add_argument("--output")
     final_parser.add_argument("--confirmed", action="store_true")
-    final_parser.set_defaults(func=command_finalize)
+    final_parser.set_defaults(func=command_finalize_full)
+
+    supplement_template_parser = subparsers.add_parser(
+        "build-supplement-template",
+        help="Export clinical-source marketed rows for optional listed-information supplementation.",
+    )
+    supplement_template_parser.add_argument("--config", required=True)
+    supplement_template_parser.add_argument("--workbook", required=True)
+    supplement_template_parser.add_argument("--output", required=True)
+    supplement_template_parser.set_defaults(func=command_build_supplement_template)
+
+    supplement_apply_parser = subparsers.add_parser(
+        "apply-supplements",
+        help="Apply returned marketed information to the full pool by locked full ID.",
+    )
+    supplement_apply_parser.add_argument("--config", required=True)
+    supplement_apply_parser.add_argument("--workbook", required=True)
+    supplement_apply_parser.add_argument("--supplement", required=True)
+    supplement_apply_parser.add_argument("--output", required=True)
+    supplement_apply_parser.add_argument("--allow-overwrite", action="store_true")
+    supplement_apply_parser.set_defaults(func=command_apply_supplements)
+
+    clean_parser = subparsers.add_parser("derive-clean", help="Derive a Working or Final Clean view from the current full pool.")
+    clean_parser.add_argument("--stage", choices=("working", "final"), required=True)
+    clean_parser.add_argument("--config", required=True)
+    clean_parser.add_argument("--workbook", required=True)
+    clean_parser.add_argument("--output", required=True)
+    clean_parser.add_argument("--include-auxiliary", action="store_true")
+    clean_parser.add_argument("--confirmed-current-full", action="store_true")
+    clean_parser.set_defaults(func=command_derive_clean)
     return parser
 
 

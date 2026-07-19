@@ -1,8 +1,14 @@
 # Decision Contract
 
+## Candidate binding
+
+`build-candidates` emits a `candidate_fingerprint`. Calculate it from immutable candidate columns, not from later decision fields. Put the exact value at the JSON root and reject a decision set when it differs from the workbook manifest.
+
+Candidate rows are audit records, not unique action records. Group by `临床来源行ID` or `临床分子序号`. Every candidate row for one clinical source row must receive the same action, corrections, carrier, rationale, and status.
+
 ## Relation sheet
 
-`build-candidates` creates one or more rows for every unique clinical source row. The fixed relation columns are:
+The fixed columns are:
 
 ```text
 判断编号
@@ -46,20 +52,18 @@ Disease修正值
 最终分子序号
 ```
 
-Candidate rows are audit records, not unique action records. Group by `临床来源行ID` or `临床分子序号`. Every row in one group must receive the same final action, correction values, and carrier.
-
 ## Final action codes
 
-| Code | Meaning | Carrier required | Enters final pool |
+| Code | Meaning | Carrier required | Enters full pool |
 |---|---|---:|---:|
 | `KEEP` | Retain the clinical row | No | Yes |
-| `DELETE_LISTED_COVERED` | One or more listed rows cover the same asset/form/Disease value | Yes | No |
+| `DELETE_LISTED_COVERED` | Listed rows cover the same asset/form/Disease value | Yes | No |
 | `EXCLUDE_NON_THERAPEUTIC` | Diagnostic/testing/imaging rather than treatment | No | No |
-| `EXCLUDE_NON_FIXED_REGIMEN` | Already-listed drugs used together without a fixed product/new molecule | No | No |
-| `EXCLUDE_PRE_SCOPE_MARKETED` | Marketed before the run window with no new Disease/form/asset value | No | No |
-| `HOLD` | Missing decision evidence | No | Never allowed in finalization |
+| `EXCLUDE_NON_FIXED_REGIMEN` | Listed drugs used together without a fixed product/new molecule | No | No |
+| `EXCLUDE_PRE_SCOPE_MARKETED` | Marketed before scope with no new Disease/form/asset value | No | No |
+| `HOLD` | Missing decision evidence | No | Never |
 
-Do not invent additional action text in the machine field. Add a new action code to both this contract and the script before using it.
+Do not create a special delete action for “stage says marketed but information is incomplete.” That is a `KEEP` merge decision plus a separate supplement state when the asset remains in scope.
 
 ## Decision status
 
@@ -72,24 +76,24 @@ Closed examples:
 轻调研已确认
 ```
 
-Any blank status, `待判断`, `待用户确认`, or `待专业数据库核验` is open. Finalization must fail while any unique clinical row is open.
+Treat a blank status, `待判断`, `待用户确认`, or `待专业数据库核验` as open. Full generation must fail while any unique clinical row is open.
 
 ## Correction values
 
 - Put the exact new Disease only in `Disease修正值`.
 - Put the exact new asset display name only in `资产名称修正值`.
-- Keep reasoning in the corresponding advice/rationale columns.
-- Leave correction-value fields empty when no change is required.
+- Keep rationale in advice/evidence fields.
+- Leave a correction field empty when no change is required.
 - Do not put `无需修改`, `—`, or prose into a correction-value field.
-
-The finalizer applies correction values only to clinical rows. It does not rewrite the raw clinical sheet.
+- Apply corrections only to the generated full baseline; never rewrite the raw clinical sheet.
 
 ## Decision JSON
 
-`import-decisions` accepts UTF-8 JSON:
+Use UTF-8 JSON:
 
 ```json
 {
+  "candidate_fingerprint": "<value emitted by build-candidates>",
   "decisions": [
     {
       "clinical_source_id": "中国临床_原始!R2",
@@ -101,7 +105,7 @@ The finalizer applies correction values only to clinical rows. It does not rewri
       "asset_name_advice": "No change.",
       "revised_relation_type": "完全重复（同资产×同剂型×同Disease）",
       "final_action": "DELETE_LISTED_COVERED",
-    "carrier_listed_sequence": "12；13",
+      "carrier_listed_sequence": "12；13",
       "rationale": "Same asset, dosage form, Disease, and indication value.",
       "evidence_source": "Source workbooks",
       "confirmation_group": "",
@@ -111,18 +115,20 @@ The finalizer applies correction values only to clinical rows. It does not rewri
 }
 ```
 
-Provide at least one of `clinical_source_id` or `clinical_sequence`. If both are present, both must identify the same relation group.
+Provide at least one of `clinical_source_id` or `clinical_sequence`. When both are present, require them to identify the same group. Reject duplicate decision objects for one clinical group.
 
-## Preview requirements
+## Full preview requirements
 
-Before generation, `finalize --mode preview` must confirm:
+`finalize-full --mode preview` must confirm:
 
+- the config/run fingerprint still matches the workbook;
+- the immutable candidate fingerprint still matches the manifest;
 - every unique clinical row has exactly one allowed action;
 - all one-to-many candidate rows agree;
 - no action is blank or `HOLD`;
 - all statuses are closed;
-- every listed-covered deletion has at least one valid listed carrier sequence; multiple carriers may be separated by `；`, `/`, or `,` and every value must exist;
+- every listed-covered deletion has valid listed carrier sequences;
 - correction values agree within each clinical group;
-- expected final rows satisfy the row formula.
+- expected full rows satisfy the row formula.
 
-Generation additionally verifies final sequences, source composition, relation mappings, raw-sheet fingerprints, and absence of trailing blank records.
+Generation additionally verifies final sequence, source composition, relation mappings, raw-sheet fingerprints, static full-pool values, and absence of trailing blank records.
